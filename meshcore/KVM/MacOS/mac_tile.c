@@ -548,15 +548,12 @@ void set_tile_compression(int type, int level)
 	//  TODO Make sure the all the types are handled. We ignore the type variable for now.
 }
 
-/* 8x8 方块均值模糊（box blur）—— 对指定矩形区域内的像素进行模糊处理
+/* 固定灰色覆盖 —— 将指定区域替换为纯灰色 RGB(128, 128, 128)，彻底遮盖原始内容
  * desktop: RGB 像素缓冲区，每像素 3 字节（R,G,B）
  * desktopsize: 缓冲区大小
- * regions: 虚化区域数组（CGRect，已缩放为缓冲区像素坐标）
+ * regions: 遮盖区域数组（CGRect，已缩放为缓冲区像素坐标）
  * regionCount: 区域数量
- * 算法：对每个区域内 8x8 像素块计算平均 RGB 值，然后填充整个块
  */
-#define BLUR_BLOCK_SIZE 8
-
 void apply_blur_to_regions(unsigned char *desktop, long long desktopsize, CGRect *regions, int regionCount)
 {
 	if (!desktop || !regions || regionCount <= 0) return;
@@ -578,45 +575,14 @@ void apply_blur_to_regions(unsigned char *desktop, long long desktopsize, CGRect
 		if (ry + rh > screen_h) rh = screen_h - ry;
 		if (rw <= 0 || rh <= 0) continue;
 
-		/* 逐块模糊 */
-		for (int by = ry; by < ry + rh; by += BLUR_BLOCK_SIZE) {
-			for (int bx = rx; bx < rx + rw; bx += BLUR_BLOCK_SIZE) {
-				/* 计算当前块的有效范围 */
-				int ex = (bx + BLUR_BLOCK_SIZE < rx + rw) ? bx + BLUR_BLOCK_SIZE : rx + rw;
-				int ey = (by + BLUR_BLOCK_SIZE < ry + rh) ? by + BLUR_BLOCK_SIZE : ry + rh;
-
-				/* 计算块内平均颜色 */
-				long sum_r = 0, sum_g = 0, sum_b = 0;
-				int count = 0;
-
-				for (int py = by; py < ey; py++) {
-					for (int px = bx; px < ex; px++) {
-						int idx = (py * screen_w + px) * 3;
-						if (idx + 2 < desktopsize) {
-							sum_r += desktop[idx];
-							sum_g += desktop[idx + 1];
-							sum_b += desktop[idx + 2];
-							count++;
-						}
-					}
-				}
-
-				if (count == 0) continue;
-
-				unsigned char avg_r = (unsigned char)(sum_r / count);
-				unsigned char avg_g = (unsigned char)(sum_g / count);
-				unsigned char avg_b = (unsigned char)(sum_b / count);
-
-				/* 填充整个块为平均颜色（马赛克效果） */
-				for (int py = by; py < ey; py++) {
-					for (int px = bx; px < ex; px++) {
-						int idx = (py * screen_w + px) * 3;
-						if (idx + 2 < desktopsize) {
-							desktop[idx] = avg_r;
-							desktop[idx + 1] = avg_g;
-							desktop[idx + 2] = avg_b;
-						}
-					}
+		/* 固定灰色填充 RGB(128, 128, 128) */
+		for (int py = ry; py < ry + rh; py++) {
+			for (int px = rx; px < rx + rw; px++) {
+				int idx = (py * screen_w + px) * 3;
+				if (idx + 2 < desktopsize) {
+					desktop[idx]     = 128;  /* R */
+					desktop[idx + 1] = 128;  /* G */
+					desktop[idx + 2] = 128;  /* B */
 				}
 			}
 		}

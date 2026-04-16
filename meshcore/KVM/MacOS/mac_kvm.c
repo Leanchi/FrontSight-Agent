@@ -34,7 +34,10 @@ limitations under the License.
 #include <string.h>
 #include <pwd.h>
 #include <ctype.h>
-#include <math.h>
+
+/* 浮点数比较宏，替代 math.h 的 fmax/fmin */
+#define FMAX(a, b) ((a) > (b) ? (a) : (b))
+#define FMIN(a, b) ((a) < (b) ? (a) : (b))
 
 /* 虚化关键字配置（测试用，不区分大小写匹配） */
 static const char *blur_keywords[] = { "Stash", "LM", NULL };
@@ -93,10 +96,10 @@ static int subtract_rect(CGRect src, CGRect sub, CGRect *out_rects, int max_out)
 
 	/* 计算交集 */
 	CGRect inter = CGRectMake(
-		fmax(src.origin.x, sub.origin.x),
-		fmax(src.origin.y, sub.origin.y),
-		fmin(src.origin.x + src.size.width, sub.origin.x + sub.size.width) - fmax(src.origin.x, sub.origin.x),
-		fmin(src.origin.y + src.size.height, sub.origin.y + sub.size.height) - fmax(src.origin.y, sub.origin.y)
+		FMAX(src.origin.x, sub.origin.x),
+		FMAX(src.origin.y, sub.origin.y),
+		FMIN(src.origin.x + src.size.width, sub.origin.x + sub.size.width) - FMAX(src.origin.x, sub.origin.x),
+		FMIN(src.origin.y + src.size.height, sub.origin.y + sub.size.height) - FMAX(src.origin.y, sub.origin.y)
 	);
 
 	if (inter.size.width <= 0 || inter.size.height <= 0) {
@@ -119,8 +122,8 @@ static int subtract_rect(CGRect src, CGRect sub, CGRect *out_rects, int max_out)
 	}
 
 	/* 上边部分（仅在左右未覆盖全高时） */
-	double top_x = fmax(src.origin.x, inter.origin.x);
-	double top_w = fmin(inter.size.width, src.size.width - (top_x - src.origin.x));
+	double top_x = FMAX(src.origin.x, inter.origin.x);
+	double top_w = FMIN(inter.size.width, src.size.width - (top_x - src.origin.x));
 	double top_h = inter.origin.y - src.origin.y;
 	if (top_h > 0 && top_w > 0 && count < max_out) {
 		out_rects[count++] = CGRectMake(top_x, src.origin.y, top_w, top_h);
@@ -343,7 +346,12 @@ int get_blurred_regions(CGRect **regions)
 			CGRect f_bounds = win_cache[f].bounds;
 			if (CGRectEqualToRect(f_bounds, CGRectZero)) continue;
 
-			/* 对当前每个可见区域，减去前方窗口的覆盖 */
+			/* 对当前每个可见区域，减去前方窗口的覆盖
+			 * 使用临时数组避免原地写入导致数据损坏
+			 * 当 subtract_rect 返回多个子矩形时，new_vis_count 可能超过 v，
+			 * 直接写 visible[] 会覆盖后续未处理的原始区域
+			 */
+			CGRect new_visible[MAX_VISIBLE_RECTS_PER_WINDOW];
 			int new_vis_count = 0;
 			for (int v = 0; v < vis_count; v++) {
 				if (new_vis_count >= MAX_VISIBLE_RECTS_PER_WINDOW - 4) {
@@ -351,19 +359,23 @@ int get_blurred_regions(CGRect **regions)
 					break;
 				}
 				if (!rect_intersects(visible[v], f_bounds)) {
-					visible[new_vis_count++] = visible[v];
+					new_visible[new_vis_count++] = visible[v];
 				} else {
 					CGRect sub_rects[4];
 					int sub_count = subtract_rect(visible[v], f_bounds, sub_rects, 4);
 					for (int s = 0; s < sub_count; s++) {
 						if (new_vis_count < MAX_VISIBLE_RECTS_PER_WINDOW) {
-							visible[new_vis_count++] = sub_rects[s];
+							new_visible[new_vis_count++] = sub_rects[s];
 						} else {
 							overflow = 1;
 							break;
 						}
 					}
 				}
+			}
+			/* 处理完成后一次性回写 */
+			for (int i = 0; i < new_vis_count; i++) {
+				visible[i] = new_visible[i];
 			}
 			vis_count = new_vis_count;
 			if (overflow || vis_count == 0) break;
@@ -1321,15 +1333,30 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
         userHomeFolderPath = pw->pw_dir;
     }
 
-    const char *testFiles[] = {
-        strcat(strcpy(malloc(strlen(userHomeFolderPath) + 30), userHomeFolderPath), "/Library/Safari/CloudTabs.db"),
-        strcat(strcpy(malloc(strlen(userHomeFolderPath) + 30), userHomeFolderPath), "/Library/Safari/Bookmarks.plist"),
-        "/Library/Application Support/com.apple.TCC/TCC.db",
-        "/Library/Preferences/com.apple.TimeMachine.plist",
-    };
+    size_t homeLen = strlen(userHomeFolderPath);
+    char *home1 = malloc(homeLen + 40);
+    char *home2 = malloc(homeLen + 40);
+
+    const char *testFiles[4];
+    testFiles[0] = NULL;
+    testFiles[1] = NULL;
+    testFiles[2] = "/Library/Application Support/com.apple.TCC/TCC.db";
+    testFiles[3] = "/Library/Preferences/com.apple.TimeMachine.plist";
+
+    if (home1) {
+        strcpy(home1, userHomeFolderPath);
+        strcat(home1, "/Library/Safari/CloudTabs.db");
+        testFiles[0] = home1;
+    }
+    if (home2) {
+        strcpy(home2, userHomeFolderPath);
+        strcat(home2, "/Library/Safari/Bookmarks.plist");
+        testFiles[1] = home2;
+    }
 
     MPAuthorizationStatus resultStatus = MPAuthorizationStatusNotDetermined;
     for (int i = 0; i < 4; i++) {
+        if (testFiles[i] == NULL) continue;
         MPAuthorizationStatus status = _checkFDAUsingFile(testFiles[i]);
         if (status == MPAuthorizationStatusAuthorized) {
             resultStatus = MPAuthorizationStatusAuthorized;
@@ -1339,6 +1366,9 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
             resultStatus = MPAuthorizationStatusDenied;
         }
     }
+
+    free(home1);
+    free(home2);
 
     return resultStatus;
 }
