@@ -33,6 +33,159 @@ limitations under the License.
 
 #include <string.h>
 #include <pwd.h>
+#include <ctype.h>
+
+/* 虚化关键字配置（测试用，不区分大小写匹配） */
+static const char *blur_keywords[] = { "Stash", NULL };
+
+/* 字符串不区分大小写包含检查 */
+static int strcasestr_custom(const char *haystack, const char *needle)
+{
+	if (!haystack || !needle) return 0;
+	size_t hlen = strlen(haystack);
+	size_t nlen = strlen(needle);
+	if (nlen > hlen) return 0;
+	if (nlen == 0) return 1;
+
+	for (size_t i = 0; i <= hlen - nlen; i++) {
+		int match = 1;
+		for (size_t j = 0; j < nlen; j++) {
+			if (tolower((unsigned char)haystack[i + j]) != tolower((unsigned char)needle[j])) {
+				match = 0;
+				break;
+			}
+		}
+		if (match) return 1;
+	}
+	return 0;
+}
+
+/* 获取需要虚化的窗口区域列表
+ * 返回区域数量，通过 regions 参数返回 CGRect 数组（调用者需调用 free_blurred_regions 释放）
+ * 坐标已乘以 SCREEN_SCALE 转换为缓冲区像素坐标
+ */
+int get_blurred_regions(CGRect **regions)
+{
+	extern int SCREEN_SCALE;
+	extern int SCREEN_WIDTH;
+	extern int SCREEN_HEIGHT;
+	extern int adjust_screen_size(int);
+	*regions = NULL;
+
+	CFArrayRef window_list = CGWindowListCopyWindowInfo(
+		kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+		kCGNullWindowID
+	);
+
+	if (!window_list) return 0;
+
+	CFIndex count = CFArrayGetCount(window_list);
+	CGRect *blur_rects = (CGRect *)malloc(count * sizeof(CGRect));
+	if (!blur_rects) {
+		CFRelease(window_list);
+		return 0;
+	}
+
+	int blur_count = 0;
+
+	for (CFIndex i = 0; i < count; i++) {
+		CFDictionaryRef win_info = (CFDictionaryRef)CFArrayGetValueAtIndex(window_list, i);
+		if (!win_info) continue;
+
+		CFNumberRef layer_num = (CFNumberRef)CFDictionaryGetValue(win_info, kCGWindowLayer);
+		if (layer_num) {
+			int layer = 0;
+			CFNumberGetValue(layer_num, kCFNumberIntType, &layer);
+			if (layer != 0) continue;
+		}
+
+		CFStringRef win_name = (CFStringRef)CFDictionaryGetValue(win_info, kCGWindowName);
+		CFStringRef owner_name = (CFStringRef)CFDictionaryGetValue(win_info, kCGWindowOwnerName);
+
+		int should_blur = 0;
+
+		if (win_name && CFStringGetLength(win_name) > 0) {
+			char buf[256];
+			if (CFStringGetCString(win_name, buf, sizeof(buf), kCFStringEncodingUTF8)) {
+				for (int k = 0; blur_keywords[k] != NULL; k++) {
+					if (strcasestr_custom(buf, blur_keywords[k])) {
+						should_blur = 1;
+						break;
+					}
+				}
+			}
+		}
+
+		if (!should_blur && owner_name && CFStringGetLength(owner_name) > 0) {
+			char buf[256];
+			if (CFStringGetCString(owner_name, buf, sizeof(buf), kCFStringEncodingUTF8)) {
+				for (int k = 0; blur_keywords[k] != NULL; k++) {
+					if (strcasestr_custom(buf, blur_keywords[k])) {
+						should_blur = 1;
+						break;
+					}
+				}
+			}
+		}
+
+		if (!should_blur) continue;
+
+		CFDictionaryRef bounds_dict = (CFDictionaryRef)CFDictionaryGetValue(win_info, kCGWindowBounds);
+		if (!bounds_dict) continue;
+
+		CGRect bounds = CGRectZero;
+		if (!CGRectMakeWithDictionaryRepresentation(bounds_dict, &bounds)) continue;
+
+		if (bounds.size.width < 50 || bounds.size.height < 50) continue;
+
+		int sw = SCREEN_SCALE > 0 ? SCREEN_SCALE : 1;
+		CGRect scaled_rect = CGRectMake(
+			bounds.origin.x * sw,
+			bounds.origin.y * sw,
+			bounds.size.width * sw,
+			bounds.size.height * sw
+		);
+
+		int adj_width = adjust_screen_size(SCREEN_WIDTH);
+		int adj_height = adjust_screen_size(SCREEN_HEIGHT > 0 ? SCREEN_HEIGHT : (int)bounds.size.height * sw);
+
+		if (scaled_rect.origin.x < 0) {
+			scaled_rect.size.width += scaled_rect.origin.x;
+			scaled_rect.origin.x = 0;
+		}
+		if (scaled_rect.origin.y < 0) {
+			scaled_rect.size.height += scaled_rect.origin.y;
+			scaled_rect.origin.y = 0;
+		}
+		if (scaled_rect.origin.x + scaled_rect.size.width > adj_width) {
+			scaled_rect.size.width = adj_width - scaled_rect.origin.x;
+		}
+		if (scaled_rect.origin.y + scaled_rect.size.height > adj_height) {
+			scaled_rect.size.height = adj_height - scaled_rect.origin.y;
+		}
+
+		if (scaled_rect.size.width <= 0 || scaled_rect.size.height <= 0) continue;
+
+		blur_rects[blur_count++] = scaled_rect;
+	}
+
+	CFRelease(window_list);
+
+	if (blur_count > 0) {
+		*regions = blur_rects;
+		return blur_count;
+	} else {
+		free(blur_rects);
+		return 0;
+	}
+}
+
+void free_blurred_regions(CGRect *regions)
+{
+	if (regions) {
+		free(regions);
+	}
+}
 
 int KVM_Listener_FD = -1;
 #define KVM_Listener_Path "/usr/local/mesh_services/meshagent/kvm"
@@ -693,6 +846,14 @@ void* kvm_server_mainloop(void* param)
 		else {
 			//senddebug(100);
 			getScreenBuffer((unsigned char **)&desktop, &desktopsize, image);
+
+			/* 虚化匹配窗口区域 */
+			CGRect *blur_regions = NULL;
+			int blur_count = get_blurred_regions(&blur_regions);
+			if (blur_count > 0 && blur_regions != NULL) {
+				apply_blur_to_regions((unsigned char *)desktop, desktopsize, blur_regions, blur_count);
+				free_blurred_regions(blur_regions);
+			}
 
 			if (KVM_AGENT_FD != -1)
 			{
