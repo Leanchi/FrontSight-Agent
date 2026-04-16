@@ -34,9 +34,21 @@ limitations under the License.
 #include <string.h>
 #include <pwd.h>
 #include <ctype.h>
+#include <math.h>
 
 /* 虚化关键字配置（测试用，不区分大小写匹配） */
-static const char *blur_keywords[] = { "Stash", NULL };
+static const char *blur_keywords[] = { "Stash", "LM", NULL };
+
+/* 裁剪矩形到屏幕范围内 */
+static CGRect clip_to_screen(CGRect r, int screen_w, int screen_h)
+{
+	if (r.origin.x < 0) { r.size.width += r.origin.x; r.origin.x = 0; }
+	if (r.origin.y < 0) { r.size.height += r.origin.y; r.origin.y = 0; }
+	if (r.origin.x + r.size.width > screen_w) r.size.width = screen_w - r.origin.x;
+	if (r.origin.y + r.size.height > screen_h) r.size.height = screen_h - r.origin.y;
+	if (r.size.width <= 0 || r.size.height <= 0) r = CGRectZero;
+	return r;
+}
 
 /* 字符串不区分大小写包含检查 */
 static int strcasestr_custom(const char *haystack, const char *needle)
@@ -60,9 +72,74 @@ static int strcasestr_custom(const char *haystack, const char *needle)
 	return 0;
 }
 
+/* 最大子矩形数，超过则回退到完整矩形虚化 */
+#define MAX_VISIBLE_RECTS_PER_WINDOW 16
+
+/* 判断两个矩形是否相交 */
+static int rect_intersects(CGRect a, CGRect b)
+{
+	return !(a.origin.x >= b.origin.x + b.size.width ||
+	         b.origin.x >= a.origin.x + a.size.width ||
+	         a.origin.y >= b.origin.y + a.size.height ||
+	         b.origin.y >= a.origin.y + a.size.height);
+}
+
+/* 从 src 中减去 sub 的交集，返回拆分后的子矩形列表（最多 4 个）
+ * 返回子矩形数量
+ */
+static int subtract_rect(CGRect src, CGRect sub, CGRect *out_rects, int max_out)
+{
+	int count = 0;
+
+	/* 计算交集 */
+	CGRect inter = CGRectMake(
+		fmax(src.origin.x, sub.origin.x),
+		fmax(src.origin.y, sub.origin.y),
+		fmin(src.origin.x + src.size.width, sub.origin.x + sub.size.width) - fmax(src.origin.x, sub.origin.x),
+		fmin(src.origin.y + src.size.height, sub.origin.y + sub.size.height) - fmax(src.origin.y, sub.origin.y)
+	);
+
+	if (inter.size.width <= 0 || inter.size.height <= 0) {
+		/* 无交集，保留原区域 */
+		if (count < max_out) out_rects[count++] = src;
+		return count;
+	}
+
+	/* 左边部分 */
+	double left_w = inter.origin.x - src.origin.x;
+	if (left_w > 0 && count < max_out) {
+		out_rects[count++] = CGRectMake(src.origin.x, src.origin.y, left_w, src.size.height);
+	}
+
+	/* 右边部分 */
+	double right_x = inter.origin.x + inter.size.width;
+	double right_w = (src.origin.x + src.size.width) - right_x;
+	if (right_w > 0 && count < max_out) {
+		out_rects[count++] = CGRectMake(right_x, src.origin.y, right_w, src.size.height);
+	}
+
+	/* 上边部分（仅在左右未覆盖全高时） */
+	double top_x = fmax(src.origin.x, inter.origin.x);
+	double top_w = fmin(inter.size.width, src.size.width - (top_x - src.origin.x));
+	double top_h = inter.origin.y - src.origin.y;
+	if (top_h > 0 && top_w > 0 && count < max_out) {
+		out_rects[count++] = CGRectMake(top_x, src.origin.y, top_w, top_h);
+	}
+
+	/* 下边部分 */
+	double bottom_y = inter.origin.y + inter.size.height;
+	double bottom_h = (src.origin.y + src.size.height) - bottom_y;
+	if (bottom_h > 0 && top_w > 0 && count < max_out) {
+		out_rects[count++] = CGRectMake(top_x, bottom_y, top_w, bottom_h);
+	}
+
+	return count;
+}
+
 /* 获取需要虚化的窗口区域列表
  * 返回区域数量，通过 regions 参数返回 CGRect 数组（调用者需调用 free_blurred_regions 释放）
  * 坐标已乘以 SCREEN_SCALE 转换为缓冲区像素坐标
+ * 考虑窗口遮挡：只虚化匹配窗口的可见部分（未被不透明上层窗口覆盖的区域）
  */
 int get_blurred_regions(CGRect **regions)
 {
@@ -72,6 +149,9 @@ int get_blurred_regions(CGRect **regions)
 	extern int adjust_screen_size(int);
 	*regions = NULL;
 
+	/* 屏幕未初始化时不调用窗口检测 */
+	if (SCREEN_WIDTH == 0 || SCREEN_HEIGHT == 0) return 0;
+
 	CFArrayRef window_list = CGWindowListCopyWindowInfo(
 		kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
 		kCGNullWindowID
@@ -80,13 +160,20 @@ int get_blurred_regions(CGRect **regions)
 	if (!window_list) return 0;
 
 	CFIndex count = CFArrayGetCount(window_list);
-	CGRect *blur_rects = (CGRect *)malloc(count * sizeof(CGRect));
-	if (!blur_rects) {
+
+	/* 限制窗口数量上限，防止系统异常返回过多窗口 */
+	if (count <= 0 || count > 200) { CFRelease(window_list); return 0; }
+
+	/* 第一遍：收集匹配窗口的索引和原始 bounds */
+	CFIndex *match_indices = (CFIndex *)malloc(count * sizeof(CFIndex));
+	CGRect *match_bounds = (CGRect *)malloc(count * sizeof(CGRect));
+	if (!match_indices || !match_bounds) {
 		CFRelease(window_list);
+		free(match_indices);
+		free(match_bounds);
 		return 0;
 	}
-
-	int blur_count = 0;
+	int match_count = 0;
 
 	for (CFIndex i = 0; i < count; i++) {
 		CFDictionaryRef win_info = (CFDictionaryRef)CFArrayGetValueAtIndex(window_list, i);
@@ -138,38 +225,168 @@ int get_blurred_regions(CGRect **regions)
 
 		if (bounds.size.width < 50 || bounds.size.height < 50) continue;
 
-		int sw = SCREEN_SCALE > 0 ? SCREEN_SCALE : 1;
-		CGRect scaled_rect = CGRectMake(
-			bounds.origin.x * sw,
-			bounds.origin.y * sw,
-			bounds.size.width * sw,
-			bounds.size.height * sw
+		match_indices[match_count] = i;
+		match_bounds[match_count] = bounds;
+		match_count++;
+	}
+
+	if (match_count == 0) {
+		CFRelease(window_list);
+		free(match_indices);
+		free(match_bounds);
+		return 0;
+	}
+
+	/* 预分配输出缓冲区 */
+	CGRect *blur_rects = (CGRect *)malloc(count * MAX_VISIBLE_RECTS_PER_WINDOW * sizeof(CGRect));
+	if (!blur_rects) {
+		CFRelease(window_list);
+		free(match_indices);
+		free(match_bounds);
+		return 0;
+	}
+
+	int adj_width = adjust_screen_size(SCREEN_WIDTH);
+	int adj_height = adjust_screen_size(SCREEN_HEIGHT);
+	int sw = SCREEN_SCALE > 0 ? SCREEN_SCALE : 1;
+
+	/* 屏幕尺寸异常时直接返回 */
+	if (adj_width <= 0 || adj_height <= 0) {
+		CFRelease(window_list);
+		free(match_indices);
+		free(match_bounds);
+		free(blur_rects);
+		return 0;
+	}
+
+	int blur_count = 0;
+
+	/* 预缓存所有窗口的 Z-order 位置和遮挡信息（避免重复查找） */
+	typedef struct {
+		CGRect bounds;
+		int is_opaque;
+	} WindowCache;
+
+	WindowCache *win_cache = (WindowCache *)malloc(count * sizeof(WindowCache));
+	if (!win_cache) {
+		CFRelease(window_list);
+		free(match_indices);
+		free(match_bounds);
+		free(blur_rects);
+		return 0;
+	}
+	for (CFIndex i = 0; i < count; i++) {
+		CFDictionaryRef win_info = (CFDictionaryRef)CFArrayGetValueAtIndex(window_list, i);
+		win_cache[i].bounds = CGRectZero;
+		win_cache[i].is_opaque = 0;
+
+		if (!win_info) continue;
+
+		CFNumberRef layer_num = (CFNumberRef)CFDictionaryGetValue(win_info, kCGWindowLayer);
+		if (layer_num) {
+			int layer = 0;
+			CFNumberGetValue(layer_num, kCFNumberIntType, &layer);
+			if (layer != 0) continue;
+		}
+
+		CFDictionaryRef bdict = (CFDictionaryRef)CFDictionaryGetValue(win_info, kCGWindowBounds);
+		if (bdict) {
+			CGRectMakeWithDictionaryRepresentation(bdict, &win_cache[i].bounds);
+		}
+
+		/* 检查窗口透明度，alpha > 0.5 视为遮挡
+		 * kCGWindowAlpha 底层是 float，不能用 kCFNumberDoubleType
+		 */
+		CFNumberRef alpha_num = (CFNumberRef)CFDictionaryGetValue(win_info, kCGWindowAlpha);
+		if (alpha_num) {
+			float alpha = 0;
+			CFNumberGetValue(alpha_num, kCFNumberFloatType, &alpha);
+			win_cache[i].is_opaque = (alpha > 0.5f) ? 1 : 0;
+		} else {
+			win_cache[i].is_opaque = 1; /* 无 alpha 信息视为不透明 */
+		}
+
+		/* 缩放 bounds */
+		win_cache[i].bounds = CGRectMake(
+			win_cache[i].bounds.origin.x * sw,
+			win_cache[i].bounds.origin.y * sw,
+			win_cache[i].bounds.size.width * sw,
+			win_cache[i].bounds.size.height * sw
 		);
+		win_cache[i].bounds = clip_to_screen(win_cache[i].bounds, adj_width, adj_height);
+	}
 
-		int adj_width = adjust_screen_size(SCREEN_WIDTH);
-		int adj_height = adjust_screen_size(SCREEN_HEIGHT > 0 ? SCREEN_HEIGHT : (int)bounds.size.height * sw);
+	/* 对每个匹配窗口，计算可见区域 */
+	for (int m = 0; m < match_count; m++) {
+		CGRect m_bounds = match_bounds[m];
+		m_bounds = CGRectMake(m_bounds.origin.x * sw, m_bounds.origin.y * sw,
+		                      m_bounds.size.width * sw, m_bounds.size.height * sw);
+		m_bounds = clip_to_screen(m_bounds, adj_width, adj_height);
+		if (CGRectEqualToRect(m_bounds, CGRectZero)) continue;
 
-		if (scaled_rect.origin.x < 0) {
-			scaled_rect.size.width += scaled_rect.origin.x;
-			scaled_rect.origin.x = 0;
-		}
-		if (scaled_rect.origin.y < 0) {
-			scaled_rect.size.height += scaled_rect.origin.y;
-			scaled_rect.origin.y = 0;
-		}
-		if (scaled_rect.origin.x + scaled_rect.size.width > adj_width) {
-			scaled_rect.size.width = adj_width - scaled_rect.origin.x;
-		}
-		if (scaled_rect.origin.y + scaled_rect.size.height > adj_height) {
-			scaled_rect.size.height = adj_height - scaled_rect.origin.y;
+		/* 可见区域列表 */
+		CGRect visible[MAX_VISIBLE_RECTS_PER_WINDOW];
+		int vis_count = 1;
+		visible[0] = m_bounds;
+		int overflow = 0;
+
+		/* 只检查 Z-order 中排在当前窗口之前的窗口（索引更小 = 更靠前） */
+		for (CFIndex f = 0; f < match_indices[m]; f++) {
+			/* 跳过自身和透明窗口 */
+			int is_self = 0;
+			for (int sm = 0; sm < match_count; sm++) {
+				if (match_indices[sm] == f) { is_self = 1; break; }
+			}
+			if (is_self) continue;
+			if (!win_cache[f].is_opaque) continue;
+
+			CGRect f_bounds = win_cache[f].bounds;
+			if (CGRectEqualToRect(f_bounds, CGRectZero)) continue;
+
+			/* 对当前每个可见区域，减去前方窗口的覆盖 */
+			int new_vis_count = 0;
+			for (int v = 0; v < vis_count; v++) {
+				if (new_vis_count >= MAX_VISIBLE_RECTS_PER_WINDOW - 4) {
+					overflow = 1;
+					break;
+				}
+				if (!rect_intersects(visible[v], f_bounds)) {
+					visible[new_vis_count++] = visible[v];
+				} else {
+					CGRect sub_rects[4];
+					int sub_count = subtract_rect(visible[v], f_bounds, sub_rects, 4);
+					for (int s = 0; s < sub_count; s++) {
+						if (new_vis_count < MAX_VISIBLE_RECTS_PER_WINDOW) {
+							visible[new_vis_count++] = sub_rects[s];
+						} else {
+							overflow = 1;
+							break;
+						}
+					}
+				}
+			}
+			vis_count = new_vis_count;
+			if (overflow || vis_count == 0) break;
 		}
 
-		if (scaled_rect.size.width <= 0 || scaled_rect.size.height <= 0) continue;
+		if (vis_count == 0) continue;
 
-		blur_rects[blur_count++] = scaled_rect;
+		/* 如果溢出（子矩形过多），回退到完整矩形 */
+		if (overflow) {
+			blur_rects[blur_count++] = m_bounds;
+		} else {
+			for (int v = 0; v < vis_count; v++) {
+				if (visible[v].size.width > 10 && visible[v].size.height > 10) {
+					blur_rects[blur_count++] = visible[v];
+				}
+			}
+		}
 	}
 
 	CFRelease(window_list);
+	free(match_indices);
+	free(match_bounds);
+	free(win_cache);
 
 	if (blur_count > 0) {
 		*regions = blur_rects;
