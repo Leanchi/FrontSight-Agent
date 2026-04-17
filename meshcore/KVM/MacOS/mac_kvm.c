@@ -39,8 +39,8 @@ limitations under the License.
 #define FMAX(a, b) ((a) > (b) ? (a) : (b))
 #define FMIN(a, b) ((a) < (b) ? (a) : (b))
 
-/* 虚化关键字配置（测试用，不区分大小写匹配） */
-static const char *blur_keywords[] = { "Stash", "LM", NULL };
+/* 虚化关键字配置已迁移到共享文件：../blur_config.h */
+#include "../blur_config.h"
 
 /* 裁剪矩形到屏幕范围内 */
 static CGRect clip_to_screen(CGRect r, int screen_w, int screen_h)
@@ -53,32 +53,7 @@ static CGRect clip_to_screen(CGRect r, int screen_w, int screen_h)
 	return r;
 }
 
-/* 字符串不区分大小写包含检查 */
-static int strcasestr_custom(const char *haystack, const char *needle)
-{
-	if (!haystack || !needle) return 0;
-	size_t hlen = strlen(haystack);
-	size_t nlen = strlen(needle);
-	if (nlen > hlen) return 0;
-	if (nlen == 0) return 1;
-
-	for (size_t i = 0; i <= hlen - nlen; i++) {
-		int match = 1;
-		for (size_t j = 0; j < nlen; j++) {
-			if (tolower((unsigned char)haystack[i + j]) != tolower((unsigned char)needle[j])) {
-				match = 0;
-				break;
-			}
-		}
-		if (match) return 1;
-	}
-	return 0;
-}
-
-/* 最大子矩形数，超过则回退到完整矩形虚化 */
-#define MAX_VISIBLE_RECTS_PER_WINDOW 16
-
-/* 判断两个矩形是否相交 */
+/* 判断两个矩形是否相交（CGRect 版本，macOS 专用） */
 static int rect_intersects(CGRect a, CGRect b)
 {
 	return !(a.origin.x >= b.origin.x + b.size.width ||
@@ -197,8 +172,8 @@ int get_blurred_regions(CGRect **regions)
 		if (win_name && CFStringGetLength(win_name) > 0) {
 			char buf[256];
 			if (CFStringGetCString(win_name, buf, sizeof(buf), kCFStringEncodingUTF8)) {
-				for (int k = 0; blur_keywords[k] != NULL; k++) {
-					if (strcasestr_custom(buf, blur_keywords[k])) {
+				for (int k = 0; k < BLUR_KEYWORD_COUNT; k++) {
+					if (should_blur_window(buf, BLUR_KEYWORDS[k])) {
 						should_blur = 1;
 						break;
 					}
@@ -209,8 +184,8 @@ int get_blurred_regions(CGRect **regions)
 		if (!should_blur && owner_name && CFStringGetLength(owner_name) > 0) {
 			char buf[256];
 			if (CFStringGetCString(owner_name, buf, sizeof(buf), kCFStringEncodingUTF8)) {
-				for (int k = 0; blur_keywords[k] != NULL; k++) {
-					if (strcasestr_custom(buf, blur_keywords[k])) {
+				for (int k = 0; k < BLUR_KEYWORD_COUNT; k++) {
+					if (should_blur_window(buf, BLUR_KEYWORDS[k])) {
 						should_blur = 1;
 						break;
 					}

@@ -42,6 +42,7 @@ extern int adjust_screen_size(int pixles);
 extern int getTileAt(int x, int y, void** buffer, long long *bufferSize, void *desktop, long long desktopsize, int row, int col);
 extern int getScreenBuffer(char **desktop, long long *desktopsize, XImage *image);
 extern void set_tile_compression(int type, int level);
+extern void apply_blur_to_regions(unsigned char *desktop, long long desktopsize, void *regions, int regionCount);
 
 
 #endif /* LINUX_TILE_H_ */
