@@ -15,6 +15,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <Carbon/Carbon.h>
+#include <ApplicationServices/ApplicationServices.h>
 #include "../Linux/linux_compression.h"
 
 enum TILE_FLAGS_ENUM {
@@ -35,6 +36,9 @@ extern int adjust_screen_size(int pixles);
 extern int getTileAt(int x, int y, void** buffer, long long *bufferSize, void *desktop, long long desktopsize, int row, int col);
 extern int getScreenBuffer(unsigned char **desktop, long long *desktopsize, CGImageRef image);
 extern void set_tile_compression(int type, int level);
+extern void apply_blur_to_regions(unsigned char *desktop, long long desktopsize, CGRect *regions, int regionCount);
+extern int get_blurred_regions(CGRect **regions);
+extern void free_blurred_regions(CGRect *regions);
 
 
 #endif /* LINUX_TILE_H_ */

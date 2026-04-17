@@ -37,6 +37,8 @@ limitations under the License.
 
 #include "linux_events.h"
 #include "linux_compression.h"
+#include "linux_blur.h"
+#include "../blur_config.h"
 
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
@@ -1271,6 +1273,14 @@ void* kvm_server_mainloop(void* parm)
 				}
 			}
 			getScreenBuffer((char **)&desktop, &desktopsize, image);
+
+			/* 虚化匹配窗口区域 */
+			BlurRect *blur_regions = NULL;
+			int blur_count = get_blurred_regions(&blur_regions);
+			if (blur_count > 0 && blur_regions != NULL) {
+				apply_blur_to_regions((unsigned char *)desktop, desktopsize, blur_regions, blur_count);
+				free_blurred_regions(blur_regions);
+			}
 
 			for (y = 0; y < TILE_HEIGHT_COUNT; y++) {
 				for (x = 0; x < TILE_WIDTH_COUNT; x++) {

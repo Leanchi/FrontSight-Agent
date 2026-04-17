@@ -26,6 +26,8 @@ extern struct tileInfo_t **g_tileInfo;
 extern unsigned char *jpeg_buffer;
 extern int jpeg_buffer_length;
 
+int adjust_screen_size(int pixles);
+
 int tilebuffersize = 0;
 void* tilebuffer = NULL;
 int COMPRESSION_QUALITY = 50;
@@ -546,3 +548,43 @@ void set_tile_compression(int type, int level)
 	//  TODO Make sure the all the types are handled. We ignore the type variable for now.
 }
 
+/* 固定灰色覆盖 —— 将指定区域替换为纯灰色 RGB(128, 128, 128)，彻底遮盖原始内容
+ * desktop: RGB 像素缓冲区，每像素 3 字节（R,G,B）
+ * desktopsize: 缓冲区大小
+ * regions: 遮盖区域数组（CGRect，已缩放为缓冲区像素坐标）
+ * regionCount: 区域数量
+ */
+void apply_blur_to_regions(unsigned char *desktop, long long desktopsize, CGRect *regions, int regionCount)
+{
+	if (!desktop || !regions || regionCount <= 0) return;
+
+	int screen_w = adjust_screen_size(SCREEN_WIDTH);
+	int screen_h = adjust_screen_size(SCREEN_HEIGHT);
+	if (screen_w <= 0 || screen_h <= 0) return;
+
+	for (int r = 0; r < regionCount; r++) {
+		int rx = (int)regions[r].origin.x;
+		int ry = (int)regions[r].origin.y;
+		int rw = (int)regions[r].size.width;
+		int rh = (int)regions[r].size.height;
+
+		/* 裁剪到有效范围 */
+		if (rx < 0) { rw += rx; rx = 0; }
+		if (ry < 0) { rh += ry; ry = 0; }
+		if (rx + rw > screen_w) rw = screen_w - rx;
+		if (ry + rh > screen_h) rh = screen_h - ry;
+		if (rw <= 0 || rh <= 0) continue;
+
+		/* 固定灰色填充 RGB(128, 128, 128) */
+		for (int py = ry; py < ry + rh; py++) {
+			for (int px = rx; px < rx + rw; px++) {
+				int idx = (py * screen_w + px) * 3;
+				if (idx + 2 < desktopsize) {
+					desktop[idx]     = 128;  /* R */
+					desktop[idx + 1] = 128;  /* G */
+					desktop[idx + 2] = 128;  /* B */
+				}
+			}
+		}
+	}
+}
