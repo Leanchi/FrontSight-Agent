@@ -1,0 +1,13 @@
+meshagent_*
+DEBUG_meshagent_*
+*.o
+mtrax
+.git
+.github
+.idea
+.vscode
+*.md
+docs
+test
+ToolChains
+node_modules
