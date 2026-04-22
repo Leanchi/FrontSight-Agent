@@ -1,9 +1,0 @@
-# MeshCentral Agent 配置文件
-# 本文件用于设置敏感窗口关键词，在屏幕共享时自动模糊包含这些关键词的窗口
-
-# 设置敏感窗口关键词列表，用于检测需要模糊处理的窗口
-# 示例场景：
-# - Clash: 网络代理工具窗口
-# - LM Studio: 本地AI模型运行工具窗口
-# - note: 笔记应用窗口（可能包含敏感信息）
-sensitiveWindowKeywords=Clash,LM Studio,LM,note

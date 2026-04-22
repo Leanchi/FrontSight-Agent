@@ -11,8 +11,8 @@
 
 /* 虚化关键字配置（不区分大小写匹配）
  * 修改此数组即可同时影响 macOS 和 Linux 平台 */
-#define BLUR_KEYWORD_COUNT 2
-static const char *BLUR_KEYWORDS[] = { "Stash", "LM" };
+#define BLUR_KEYWORD_COUNT 4
+static const char *BLUR_KEYWORDS[] = { "Stash", "LM", "控制中心", "字体" };
 
 #define MAX_VISIBLE_RECTS_PER_WINDOW 16
 

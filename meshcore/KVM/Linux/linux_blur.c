@@ -9,6 +9,17 @@
 #include <X11/Xatom.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+
+#ifdef BLUR_DEBUG
+static FILE *blur_log = NULL;
+#define BLUR_LOG(fmt, ...) do { \
+    if (!blur_log) blur_log = fopen("/tmp/blur_debug.log", "w"); \
+    if (blur_log) { fprintf(blur_log, fmt, ##__VA_ARGS__); fflush(blur_log); } \
+} while(0)
+#else
+#define BLUR_LOG(fmt, ...)
+#endif
 
 /* 裁剪矩形到屏幕范围内 */
 static void clip_rect(BlurRect *r, int screen_w, int screen_h)
@@ -91,21 +102,18 @@ static char *get_window_title(Display *disp, Window win)
 
         if (XGetWindowProperty(disp, win, net_wm_name, 0, 1024, False,
                                AnyPropertyType, &actual_type, &actual_format,
-                               &nitems, &bytes_after, &prop) == Success && prop) {
-            if (actual_type == XA_STRING && nitems > 0) {
-                result = strdup((char *)prop);
-            }
+                               &nitems, &bytes_after, &prop) == Success && prop && nitems > 0) {
+            result = strdup((char *)prop);
             XFree(prop);
+            if (result) return result;  /* 获取成功，直接返回 */
         }
     }
 
     /* 回退到 WM_NAME */
-    if (!result) {
-        char *wm_name = NULL;
-        if (XFetchName(disp, win, &wm_name) && wm_name) {
-            result = strdup(wm_name);
-            XFree(wm_name);
-        }
+    char *wm_name = NULL;
+    if (XFetchName(disp, win, &wm_name) && wm_name) {
+        result = strdup(wm_name);
+        XFree(wm_name);
     }
 
     return result;
@@ -127,18 +135,29 @@ int get_blurred_regions(BlurRect **regions)
 {
     *regions = NULL;
 
+#ifdef BLUR_DEBUG
+    if (blur_log) { fclose(blur_log); blur_log = NULL; }
+    BLUR_LOG("[BLUR] get_blurred_regions called\n");
+#endif
+
     Display *disp = XOpenDisplay(NULL);
-    if (!disp) return 0;
+    if (!disp) {
+        BLUR_LOG("[BLUR] XOpenDisplay(NULL) failed, DISPLAY=%s\n", getenv("DISPLAY") ? getenv("DISPLAY") : "(null)");
+        return 0;
+    }
+    BLUR_LOG("[BLUR] XOpenDisplay OK, DISPLAY=%s\n", getenv("DISPLAY") ? getenv("DISPLAY") : "(null)");
 
     int screen_num = DefaultScreen(disp);
     int screen_w = DisplayWidth(disp, screen_num);
     int screen_h = DisplayHeight(disp, screen_num);
+    BLUR_LOG("[BLUR] Screen: %dx%d\n", screen_w, screen_h);
 
     if (screen_w == 0 || screen_h == 0) { XCloseDisplay(disp); return 0; }
 
     /* 获取 _NET_CLIENT_LIST_STACKING atom */
     Atom client_list_stacking = XInternAtom(disp, "_NET_CLIENT_LIST_STACKING", True);
     if (client_list_stacking == None) {
+        BLUR_LOG("[BLUR] _NET_CLIENT_LIST_STACKING not supported by WM\n");
         XCloseDisplay(disp);
         return 0;
     }
@@ -153,6 +172,7 @@ int get_blurred_regions(BlurRect **regions)
     if (XGetWindowProperty(disp, root, client_list_stacking, 0, 1024,
                            False, XA_WINDOW, &actual_type, &actual_format,
                            &nitems, &bytes_after, &prop) != Success || !prop) {
+        BLUR_LOG("[BLUR] XGetWindowProperty(_NET_CLIENT_LIST_STACKING) failed\n");
         XCloseDisplay(disp);
         return 0;
     }
@@ -160,8 +180,11 @@ int get_blurred_regions(BlurRect **regions)
     Window *windows = (Window *)prop;
     int count = (int)nitems;
 
+    BLUR_LOG("[BLUR] _NET_CLIENT_LIST_STACKING returned %d windows\n", count);
+
     /* 限制窗口数量上限 */
     if (count <= 0 || count > 200) {
+        BLUR_LOG("[BLUR] Window count out of range: %d\n", count);
         XFree(prop);
         XCloseDisplay(disp);
         return 0;
@@ -184,8 +207,13 @@ int get_blurred_regions(BlurRect **regions)
     for (int i = 0; i < count; i++) {
         XWindowAttributes attr;
         if (XGetWindowAttributes(disp, windows[i], &attr)) {
-            win_info[i].x = attr.x;
-            win_info[i].y = attr.y;
+            int root_x = 0, root_y = 0;
+            Window child;
+            /* 将窗口左上角转换为根窗口坐标（UOS/DDE 的窗口坐标相对于父窗口，不是根窗口） */
+            XTranslateCoordinates(disp, windows[i], attr.root,
+                                  0, 0, &root_x, &root_y, &child);
+            win_info[i].x = root_x;
+            win_info[i].y = root_y;
             win_info[i].w = attr.width;
             win_info[i].h = attr.height;
             win_info[i].is_visible = (attr.map_state == IsViewable) ? 1 : 0;
@@ -211,7 +239,11 @@ int get_blurred_regions(BlurRect **regions)
         if (win_info[i].w < 50 || win_info[i].h < 50) continue;
 
         char *title = get_window_title(disp, windows[i]);
+        BLUR_LOG("[BLUR] Window[%d]: pos=(%d,%d) size=%dx%d visible=1 title=[%s]\n",
+                 i, win_info[i].x, win_info[i].y, win_info[i].w, win_info[i].h,
+                 title ? title : "(null)");
         if (title && title_matches_blur(title)) {
+            BLUR_LOG("[BLUR]   *** MATCHED blur keyword\n");
             match_indices[match_count] = i;
             match_bounds[match_count] = (BlurRect){win_info[i].x, win_info[i].y, win_info[i].w, win_info[i].h};
             match_count++;
@@ -220,6 +252,8 @@ int get_blurred_regions(BlurRect **regions)
     }
 
     XFree(prop);
+
+    BLUR_LOG("[BLUR] Matched %d windows\n", match_count);
 
     if (match_count == 0) {
         free(win_info);
@@ -252,8 +286,9 @@ int get_blurred_regions(BlurRect **regions)
         visible[0] = m_bounds;
         int overflow = 0;
 
-        /* 只检查 Z-order 中排在当前窗口之前的窗口（索引更小 = 更靠前） */
-        for (int f = 0; f < match_indices[m]; f++) {
+        /* _NET_CLIENT_LIST_STACKING 返回的顺序是底层→顶层（索引小=在后面）
+         * 只检查索引更大（Z-order 更靠前）的窗口来遮挡计算 */
+        for (int f = match_indices[m] + 1; f < count; f++) {
             if (!win_info[f].is_visible) continue;
             if (!win_info[f].is_opaque) continue;
 
@@ -308,6 +343,8 @@ int get_blurred_regions(BlurRect **regions)
     free(match_indices);
     free(match_bounds);
     XCloseDisplay(disp);
+
+    BLUR_LOG("[BLUR] Final: %d blur regions computed\n", blur_count);
 
     if (blur_count > 0) {
         *regions = blur_rects;

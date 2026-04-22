@@ -30,7 +30,8 @@ limitations under the License.
 #include "microstack/ILibCrypto.h"
 #include "ILibDuktape_EventEmitter.h"
 
-char stash_key[32];
+char
+stash_key[32];
 struct sockaddr_in6 duktape_internalAddress;
 
 #define ILibDuktape_EventEmitter_Table						"\xFF_EventEmitterTable"

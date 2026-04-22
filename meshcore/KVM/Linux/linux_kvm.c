@@ -608,6 +608,13 @@ int kvm_init(int displayNo)
 	SCREEN_WIDTH = DisplayWidth(eventdisplay, SCREEN_NUM);
 	SCREEN_DEPTH = DefaultDepth(eventdisplay, SCREEN_NUM);
 
+		// 2026-04-22, leanchiliu, 订阅根窗口的子窗口结构变化事件（ConfigureNotify等）
+		// 用于在帧率等待循环中检测窗口位置变化，立即触发下一帧捕获
+		{
+			Window _rootwin = x11_exports->XRootWindow(eventdisplay, CURRENT_DISPLAY_ID);
+			x11_exports->XSelectInput(eventdisplay, _rootwin, SubstructureNotifyMask);
+		}
+
 	if (SCREEN_DEPTH < 15) {
 		// fprintf(stderr, "kvm_init: We do not support display depth < 15.");
 		return -1;
@@ -617,7 +624,8 @@ int kvm_init(int displayNo)
 	TILE_WIDTH = 32;
 	TILE_HEIGHT = 32;
 	COMPRESSION_RATIO = 50;
-	FRAME_RATE_TIMER = 100;
+	// 2026-04-22, leanchiliu, 帧率从100ms降到50ms(~20FPS)，改善窗口拖动时虚化跟随延迟
+	FRAME_RATE_TIMER = 50;
 
 	TILE_HEIGHT_COUNT = SCREEN_HEIGHT / TILE_HEIGHT;
 	TILE_WIDTH_COUNT = SCREEN_WIDTH / TILE_WIDTH;
@@ -1274,9 +1282,16 @@ void* kvm_server_mainloop(void* parm)
 			}
 			getScreenBuffer((char **)&desktop, &desktopsize, image);
 
+#ifdef BLUR_DEBUG
+			if (logFile) { fprintf(logFile, "[BLUR] About to call get_blurred_regions(), DISPLAY=%s\n", getenv("DISPLAY") ? getenv("DISPLAY") : "(null)"); fflush(logFile); }
+#endif
+
 			/* 虚化匹配窗口区域 */
 			BlurRect *blur_regions = NULL;
 			int blur_count = get_blurred_regions(&blur_regions);
+#ifdef BLUR_DEBUG
+			if (logFile) { fprintf(logFile, "[BLUR] get_blurred_regions returned blur_count=%d\n", blur_count); fflush(logFile); }
+#endif
 			if (blur_count > 0 && blur_regions != NULL) {
 				apply_blur_to_regions((unsigned char *)desktop, desktopsize, blur_regions, blur_count);
 				free_blurred_regions(blur_regions);
@@ -1320,23 +1335,28 @@ void* kvm_server_mainloop(void* parm)
 			imagedisplay = NULL;
 		}
 
-		// We can't go full speed here, we need to slow this down.
-		height = FRAME_RATE_TIMER;
-		while (!g_shutdown && height > 0)
-		{
-			if (height > 50)
+			// 2026-04-22, leanchiliu, 改为事件驱动等待：监听 X11 ConfigureNotify 事件，窗口移动时立即捕获下一帧
 			{
-				height -= 50;
-				maxsleep = 50000;
+				int event_fd = x11_exports->XConnectionNumber(eventdisplay);
+				height = FRAME_RATE_TIMER;
+				while (!g_shutdown && height > 0)
+				{
+					int wait_ms = (height > 50) ? 50 : height;
+					FD_ZERO(&readset);
+					FD_SET(event_fd, &readset);
+					tv.tv_sec = 0;
+					tv.tv_usec = wait_ms * 1000;
+					if (select(event_fd + 1, &readset, NULL, NULL, &tv) > 0) {
+						// X11 事件到达（如 ConfigureNotify），读取并丢弃
+						while (x11_exports->XPending(eventdisplay)) {
+							XEvent xe;
+							x11_exports->XNextEvent(eventdisplay, &xe);
+						}
+						break;  // 立即开始下一帧
+					}
+					height -= wait_ms;
+				}
 			}
-			else 
-			{
-				maxsleep = height * 1000;
-				height = 0;
-			}
-
-			usleep(maxsleep);
-		}
 	}
 
 	if (desktop != NULL) { free(desktop); desktop = NULL; }
