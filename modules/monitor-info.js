@@ -379,6 +379,28 @@ function monitorinfo()
                     this._X11.CreateMethod('XGetKeyboardMapping');
                     this._X11.CreateMethod('XStringToKeysym');
                     this._X11.CreateMethod('XChangeKeyboardMapping');
+
+                    // 画笔覆盖层绘图绑定
+                    this._X11.CreateMethod('XFillArc');
+                    this._X11.CreateMethod('XDrawArc');
+                    this._X11.CreateMethod('XFillRectangle');
+                    this._X11.CreateMethod('XDrawPoint');
+                    this._X11.CreateMethod('XClearWindow');
+                    this._X11.CreateMethod('XClearArea');
+                    this._X11.CreateMethod('XGetVisualInfo');
+                    this._X11.CreateMethod('XVisualIDFromVisual');
+                    this._X11.CreateMethod('XCreateColormap');
+                    this._X11.CreateMethod('XDefaultDepth');
+                    this._X11.CreateMethod('XDefaultVisual');
+                    this._X11.CreateMethod('XSetBackground');
+                    this._X11.CreateMethod('XSetFillStyle');
+                    this._X11.CreateMethod('XCreatePixmap');
+                    this._X11.CreateMethod('XFreePixmap');
+                    this._X11.CreateMethod('XCopyArea');
+                    this._X11.CreateMethod('XFreeGC');
+                    this._X11.CreateMethod('XFreeColormap');
+                    this._X11.CreateMethod('XMoveResizeWindow');
+                    this._X11.CreateMethod('XUnmapWindow');
                 }
 
                 var ch = require('child_process').execFile('/bin/sh', ['sh']);
