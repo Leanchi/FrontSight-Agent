@@ -15,9 +15,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 红点画笔覆盖层 - 在 UOS Linux 桌面上创建 X11 ARGB 透明窗口，
-绘制红笔标注、支持橡皮擦和 5s 自动消失。
+绘制红笔标注、支持橡皮擦和流星式自动消失（每点 5s 过期）。
 通过 stdin 接收 JSON 命令，每行一条。
 */
+
+console.log('paintbrush-overlay: 脚本开始执行...');
 
 var mi = require('monitor-info');
 var GM = require('_GenericMarshal');
@@ -54,6 +56,7 @@ var gc = null;
 var screenInfo = null;  // { width, height, screenId, rootWindow }
 var activeStrokes = {};  // strokeId -> { tool, points, timestamp, timerId }
 var strokeOrder = [];    // 笔画绘制顺序
+var timedPenInterval = null;  // setInterval ID for timedpen 过期裁剪
 
 // ============================================================
 // X11 透明窗口创建
@@ -61,20 +64,6 @@ var strokeOrder = [];    // 笔画绘制顺序
 
 function findARGBVisual(disp, screenId)
 {
-    // 查找 depth=32, TrueColor 的 ARGB visual
-    // XVisualInfo 结构布局（64 位）：
-    //   Visual* visual      offset 0,  8 bytes
-    //   VisualID visualid   offset 8,  8 bytes
-    //   int screen          offset 16, 4 bytes
-    //   unsigned int depth  offset 20, 4 bytes
-    //   int class           offset 24, 4 bytes
-    // XVisualInfo 结构布局（32 位）：
-    //   Visual* visual      offset 0,  4 bytes
-    //   VisualID visualid   offset 4,  4 bytes
-    //   int screen          offset 8,  4 bytes
-    //   unsigned int depth  offset 12, 4 bytes
-    //   int class           offset 16, 4 bytes
-
     var template = GM.CreateVariable(64);
     var screenOffset = GM.PointerSize == 8 ? 16 : 8;
     var depthOffset = GM.PointerSize == 8 ? 20 : 12;
@@ -89,7 +78,6 @@ function findARGBVisual(disp, screenId)
 
     if (visualList.Val != 0 && countPtr.toBuffer().readUInt32LE() > 0)
     {
-        // visual 指针在 XVisualInfo 的 offset 0
         var visualPtr = visualList.Deref(0, GM.PointerSize);
         X11.XFree(visualList);
         return visualPtr;
@@ -101,18 +89,16 @@ function findARGBVisual(disp, screenId)
 
 function createOverlayWindow()
 {
-    // 检查 DISPLAY 环境变量
     if (!process.env.DISPLAY)
     {
-        console.info1('paintbrush-overlay: DISPLAY 环境变量未设置');
+        console.log('paintbrush-overlay: DISPLAY 环境变量未设置');
         return false;
     }
 
-    // 打开 X11 显示
     display = X11.XOpenDisplay(GM.CreateVariable(process.env.DISPLAY));
     if (display.Val == 0)
     {
-        console.info1('paintbrush-overlay: XOpenDisplay 失败');
+        console.log('paintbrush-overlay: XOpenDisplay 失败');
         return false;
     }
 
@@ -123,109 +109,50 @@ function createOverlayWindow()
 
     screenInfo = { width: width, height: height, screenId: screenId, rootWindow: rootWindow };
 
-    // 尝试查找 ARGB visual
     var visual = findARGBVisual(display, screenId);
     var depth = 32;
 
     if (visual == null)
     {
-        // 降级方案：使用默认 visual + XShape 或纯窗口
-        console.info1('paintbrush-overlay: 未找到 ARGB visual，使用默认 visual');
+        console.log('paintbrush-overlay: 未找到 ARGB visual，使用默认 visual');
         visual = X11.XDefaultVisual(display, screenId);
         depth = X11.XDefaultDepth(display, screenId).Val;
     }
 
-    // 创建 colormap
     var colormap = X11.XCreateColormap(display, rootWindow, visual, 0);
-
-    // 构造 XSetWindowAttributes 结构
-    // XSetWindowAttributes 布局（64 位）：
-    //   Pixmap background_pixmap;       // offset 0,  8 bytes
-    //   unsigned long background_pixel; // offset 8,  8 bytes
-    //   unsigned long border_pixel;     // offset 16, 8 bytes
-    //   int bit_gravity;                // offset 24, 4 bytes
-    //   int win_gravity;                // offset 28, 4 bytes
-    //   int backing_store;              // offset 32, 4 bytes
-    //   (padding)                       // offset 36, 4 bytes
-    //   unsigned long backing_planes;   // offset 40, 8 bytes
-    //   unsigned long backing_pixel;    // offset 48, 8 bytes
-    //   Bool save_under;                // offset 56, 4 bytes
-    //   (padding)                       // offset 60, 4 bytes
-    //   long event_mask;                // offset 64, 8 bytes
-    //   long do_not_propagate_mask;     // offset 72, 8 bytes
-    //   Bool override_redirect;         // offset 80, 4 bytes
-    //   (padding)                       // offset 84, 4 bytes
-    //   Colormap colormap;              // offset 88, 8 bytes
-    //   Cursor cursor;                  // offset 96, 8 bytes
-    // 总计: 104 bytes
-    //
-    // XSetWindowAttributes 布局（32 位）：
-    //   Pixmap background_pixmap;       // offset 0,  4 bytes
-    //   unsigned long background_pixel; // offset 4,  4 bytes
-    //   unsigned long border_pixel;     // offset 8,  4 bytes
-    //   int bit_gravity;                // offset 12, 4 bytes
-    //   int win_gravity;                // offset 16, 4 bytes
-    //   int backing_store;              // offset 20, 4 bytes
-    //   unsigned long backing_planes;   // offset 24, 4 bytes
-    //   unsigned long backing_pixel;    // offset 28, 4 bytes
-    //   Bool save_under;                // offset 32, 4 bytes
-    //   long event_mask;                // offset 36, 4 bytes
-    //   long do_not_propagate_mask;     // offset 40, 4 bytes
-    //   Bool override_redirect;         // offset 44, 4 bytes
-    //   Colormap colormap;              // offset 48, 4 bytes
-    //   Cursor cursor;                  // offset 52, 4 bytes
-    // 总计: 56 bytes
 
     var attrSize = GM.PointerSize == 8 ? 104 : 56;
     var attrs = GM.CreateVariable(attrSize);
 
-    var borderPixelOffset = GM.PointerSize * 2;  // 16 (64-bit) / 8 (32-bit)
+    var borderPixelOffset = GM.PointerSize * 2;
     var colormapOffset = GM.PointerSize == 8 ? 88 : 48;
 
-    // background_pixmap = None (0)
     attrs.Deref(0, GM.PointerSize).toBuffer().writeUInt32LE(0);
-    // border_pixel = 0
     attrs.Deref(borderPixelOffset, 4).toBuffer().writeUInt32LE(0);
-    // colormap
     colormap.pointerBuffer().copy(attrs.Deref(colormapOffset, GM.PointerSize).toBuffer());
 
     var valuemask = CWBackPixmap | CWColormap | CWBorderPixel;
 
-    // 创建窗口
     overlayWindow = X11.XCreateWindow(
         display, rootWindow,
         0, 0, width, height,
-        0,            // border_width
-        depth,        // depth
-        InputOutput,  // class
-        visual,       // visual
-        valuemask,    // valuemask
-        attrs         // attributes
+        0, depth, InputOutput, visual, valuemask, attrs
     );
 
     if (overlayWindow.Val == 0)
     {
-        console.info1('paintbrush-overlay: XCreateWindow 失败');
+        console.log('paintbrush-overlay: XCreateWindow 失败');
         return false;
     }
 
-    // 设置窗口属性
     X11.XStoreName(display, overlayWindow, GM.CreateVariable('meshcentral-paintbrush'));
     X11.Xutf8SetWMProperties(display, overlayWindow, GM.CreateVariable('meshcentral-paintbrush'), 0, 0, 0, 0, 0, 0);
 
-    // 无装饰
     mi.unDecorateWindow(display, overlayWindow);
-
-    // 不允许窗口操作
     mi.setAllowedActions(display, overlayWindow, 0);
-
-    // 置顶
     mi.setAlwaysOnTop(display, rootWindow, overlayWindow);
-
-    // 不在任务栏显示
     mi.hideWindowIcon(display, rootWindow, overlayWindow);
 
-    // 设置窗口类型为 NOTIFICATION/DOCK 使窗口管理器不干扰
     var wmWindowType = X11.XInternAtom(display, GM.CreateVariable('_NET_WM_WINDOW_TYPE'), 0);
     var wmTypeNotification = X11.XInternAtom(display, GM.CreateVariable('_NET_WM_WINDOW_TYPE_NOTIFICATION'), 0);
     if (wmWindowType.Val != 0 && wmTypeNotification.Val != 0)
@@ -235,17 +162,14 @@ function createOverlayWindow()
         X11.XChangeProperty(display, overlayWindow, wmWindowType, XA_ATOM, 32, PropModeReplace, atomData, 1);
     }
 
-    // 设置窗口大小提示（固定大小，不允许缩放）
     mi.setWindowSizeHints(display, overlayWindow, 0, 0, width, height, width, height, width, height);
 
-    // 创建 Graphics Context
     gc = X11.XCreateGC(display, overlayWindow, 0, 0);
 
-    // 映射窗口
     X11.XMapWindow(display, overlayWindow);
     X11.XFlush(display);
 
-    console.info1('paintbrush-overlay: 窗口创建成功 (' + width + 'x' + height + ')');
+    console.log('paintbrush-overlay: 窗口创建成功 (' + width + 'x' + height + ')');
     return true;
 }
 
@@ -264,9 +188,9 @@ function drawDot(x, y, radius)
 {
     X11.XSetForeground(display, gc, COLOR_RED);
     X11.XFillArc(display, overlayWindow, gc,
-        x - radius, y - radius,  // x, y (外接矩形左上角)
-        radius * 2, radius * 2,  // width, height
-        0, 360 * ARC_ANGLE_SCALE // angle1=0, angle2=360*64=全圆
+        x - radius, y - radius,
+        radius * 2, radius * 2,
+        0, 360 * ARC_ANGLE_SCALE
     );
 }
 
@@ -276,12 +200,10 @@ function drawStroke(stroke)
 
     if (stroke.points.length == 1)
     {
-        // 单点画红点
         drawDot(stroke.points[0].x, stroke.points[0].y, PEN_WIDTH);
     }
     else
     {
-        // 多点画连线
         for (var i = 1; i < stroke.points.length; i++)
         {
             drawLine(
@@ -289,7 +211,6 @@ function drawStroke(stroke)
                 stroke.points[i].x, stroke.points[i].y
             );
         }
-        // 在端点画红点让线条更圆滑
         drawDot(stroke.points[0].x, stroke.points[0].y, PEN_WIDTH);
         drawDot(stroke.points[stroke.points.length - 1].x, stroke.points[stroke.points.length - 1].y, PEN_WIDTH);
     }
@@ -303,6 +224,74 @@ function redrawAll()
         drawStroke(activeStrokes[strokeOrder[i]]);
     }
     X11.XFlush(display);
+}
+
+// ============================================================
+// timedpen 流星效果：逐点过期裁剪
+// ============================================================
+
+function timedPenTick()
+{
+    var now = Date.now();
+    var needRedraw = false;
+    var anyTimedPen = false;
+
+    for (var i = strokeOrder.length - 1; i >= 0; i--)
+    {
+        var id = strokeOrder[i];
+        var stroke = activeStrokes[id];
+        if (!stroke || stroke.tool !== 'timedpen') continue;
+
+        anyTimedPen = true;
+
+        // 裁剪超过 5s 的点
+        while (stroke.points.length > 0 && stroke.points[0].t != null && (now - stroke.points[0].t) > 5000)
+        {
+            stroke.points.shift();
+            needRedraw = true;
+        }
+
+        // 所有点过期则移除笔画
+        if (stroke.points.length === 0)
+        {
+            delete activeStrokes[id];
+            strokeOrder.splice(i, 1);
+            needRedraw = true;
+            anyTimedPen = false;
+        }
+    }
+
+    if (needRedraw)
+    {
+        redrawAll();
+    }
+
+    // 没有 timedpen 笔画了，停止 tick
+    if (!anyTimedPen)
+    {
+        // 再次确认
+        for (var j = 0; j < strokeOrder.length; j++)
+        {
+            if (activeStrokes[strokeOrder[j]] && activeStrokes[strokeOrder[j]].tool === 'timedpen')
+            {
+                anyTimedPen = true;
+                break;
+            }
+        }
+        if (!anyTimedPen && timedPenInterval)
+        {
+            clearInterval(timedPenInterval);
+            timedPenInterval = null;
+        }
+    }
+}
+
+function startTimedPenTickIfNeeded()
+{
+    if (!timedPenInterval)
+    {
+        timedPenInterval = setInterval(timedPenTick, 100);
+    }
 }
 
 // ============================================================
@@ -325,13 +314,10 @@ function addStroke(strokeId, tool, points, timestamp)
     drawStroke(entry);
     X11.XFlush(display);
 
-    // 5s 自动消失
+    // timedpen 启动逐点过期 tick
     if (tool === 'timedpen')
     {
-        entry.timerId = setTimeout(function ()
-        {
-            removeStroke(strokeId);
-        }, 5000);
+        startTimedPenTickIfNeeded();
     }
 }
 
@@ -346,11 +332,9 @@ function removeStroke(strokeId)
 
     delete activeStrokes[strokeId];
 
-    // 从顺序列表中移除
     var idx = strokeOrder.indexOf(strokeId);
     if (idx >= 0) { strokeOrder.splice(idx, 1); }
 
-    // 重绘剩余笔画
     redrawAll();
 }
 
@@ -359,6 +343,8 @@ function eraseAt(x, y, radius)
     var toRemove = [];
     for (var id in activeStrokes)
     {
+        // 橡皮擦只作用于 pen 笔画
+        if (activeStrokes[id].tool !== 'pen') continue;
         if (strokeIntersects(activeStrokes[id], x, y, radius))
         {
             toRemove.push(id);
@@ -400,8 +386,36 @@ function clearAll()
     }
     activeStrokes = {};
     strokeOrder = [];
+    if (timedPenInterval)
+    {
+        clearInterval(timedPenInterval);
+        timedPenInterval = null;
+    }
     X11.XClearWindow(display, overlayWindow);
     X11.XFlush(display);
+}
+
+function clearPenOnly()
+{
+    var toRemove = [];
+    for (var id in activeStrokes)
+    {
+        if (activeStrokes[id].tool === 'pen')
+        {
+            if (activeStrokes[id].timerId != null)
+            {
+                clearTimeout(activeStrokes[id].timerId);
+            }
+            toRemove.push(id);
+        }
+    }
+    for (var i = 0; i < toRemove.length; i++)
+    {
+        delete activeStrokes[toRemove[i]];
+        var idx = strokeOrder.indexOf(toRemove[i]);
+        if (idx >= 0) { strokeOrder.splice(idx, 1); }
+    }
+    redrawAll();
 }
 
 function strokeIntersects(stroke, x, y, radius)
@@ -427,6 +441,33 @@ function processCommand(cmd)
         case 'stroke':
             addStroke(cmd.strokeId, cmd.tool, cmd.points, cmd.timestamp);
             break;
+        case 'stroke_start':
+            // timedpen 增量模式：开始新笔画
+            addStroke(cmd.strokeId, cmd.tool, [cmd.firstPoint], Date.now());
+            break;
+        case 'stroke_append':
+            // timedpen 增量模式：追加点位
+            if (activeStrokes[cmd.strokeId] && cmd.points && cmd.points.length > 0)
+            {
+                var stroke = activeStrokes[cmd.strokeId];
+                for (var i = 0; i < cmd.points.length; i++)
+                {
+                    stroke.points.push(cmd.points[i]);
+                }
+                // 增量绘制新线段
+                var startIdx = Math.max(1, stroke.points.length - cmd.points.length);
+                for (var j = startIdx; j < stroke.points.length; j++)
+                {
+                    drawLine(stroke.points[j - 1].x, stroke.points[j - 1].y, stroke.points[j].x, stroke.points[j].y);
+                }
+                // 画端点
+                drawDot(stroke.points[stroke.points.length - 1].x, stroke.points[stroke.points.length - 1].y, PEN_WIDTH);
+                X11.XFlush(display);
+            }
+            break;
+        case 'stroke_end':
+            // timedpen 笔画完成，tick 接管过期
+            break;
         case 'erase':
             if (cmd.strokeIds && cmd.strokeIds.length > 0)
             {
@@ -439,6 +480,9 @@ function processCommand(cmd)
             break;
         case 'clear':
             clearAll();
+            break;
+        case 'clear_pen':
+            clearPenOnly();
             break;
         case 'batch':
             if (cmd.commands)
@@ -458,12 +502,12 @@ function processCommand(cmd)
 
 function main()
 {
+    console.setInfoLevel(1); // 启用 console.info1 输出（Duktape 默认 INFO_Level=0 会抑制）
     if (!createOverlayWindow())
     {
         process.exit(1);
     }
 
-    // stdin 命令循环
     process.stdin.resume();
     process.stdin.setEncoding('utf8');
     var buffer = '';
@@ -472,7 +516,7 @@ function main()
     {
         buffer += chunk;
         var lines = buffer.split('\n');
-        buffer = lines.pop();  // 保留不完整的行
+        buffer = lines.pop();
 
         for (var i = 0; i < lines.length; i++)
         {
@@ -485,19 +529,17 @@ function main()
             }
             catch (ex)
             {
-                console.info1('paintbrush-overlay: 命令解析失败: ' + ex);
+                console.log('paintbrush-overlay: 命令解析失败: ' + ex);
             }
         }
     });
 
     process.stdin.on('end', function ()
     {
-        // stdin 关闭，清理并退出
         cleanup();
         process.exit(0);
     });
 
-    // 退出时清理
     process.on('exit', function ()
     {
         cleanup();
@@ -506,7 +548,6 @@ function main()
 
 function cleanup()
 {
-    // 清理所有定时器
     for (var id in activeStrokes)
     {
         if (activeStrokes[id].timerId != null)
@@ -516,6 +557,12 @@ function cleanup()
     }
     activeStrokes = {};
     strokeOrder = [];
+
+    if (timedPenInterval)
+    {
+        clearInterval(timedPenInterval);
+        timedPenInterval = null;
+    }
 
     if (overlayWindow != null && overlayWindow.Val != 0 && display != null && display.Val != 0)
     {
