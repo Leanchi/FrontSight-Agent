@@ -24,8 +24,20 @@ static Display *overlayDisplay = NULL;
 static Window overlayWindow = 0;
 static GC overlayGC = 0;
 static GC overlayClearGC = 0;
+static Colormap overlayColormap = 0;
 static int screenWidth = 0;
 static int screenHeight = 0;
+
+/* Backing pixmap：所有绘图先写到这个 pixmap，flush 时再复制到窗口，
+ * 避免合成器在错误的 ShapeBounding context 下处理 damage 事件 */
+static Pixmap overlayBackPixmap = 0;
+
+/* ShapeBounding 位图：KWin 合成器尊重 ShapeBounding（而非 ShapeInput），
+ * 用 depth=1 位图控制窗口在合成器场景图中的"存在范围"。
+ * 位图 1=窗口存在（阻挡点击），0=窗口不存在（鼠标穿透） */
+static Pixmap shapeBoundingBitmap = 0;
+static GC shapeBoundingGC = 0;       /* foreground=1, line_width=7 */
+static GC shapeBoundingClearGC = 0;  /* foreground=0 */
 
 /* ============================================================
    initOverlay(displayName)
@@ -45,8 +57,6 @@ duk_ret_t paintbrush_initOverlay(duk_context *ctx)
 	int depth;
 	Colormap colormap;
 	XSetWindowAttributes attrs;
-	Atom wmWindowType;
-	Atom wmTypeNotification;
 	XGCValues gcValues;
 
 	/* 检查 -- already initialized */
@@ -114,6 +124,7 @@ duk_ret_t paintbrush_initOverlay(duk_context *ctx)
 
 	/* 创建 Colormap */
 	colormap = XCreateColormap(overlayDisplay, root, visual, AllocNone);
+	overlayColormap = colormap;
 
 	/* 创建窗口 */
 	/* ARGB depth=32 不能用 ParentRelative（与 root 的 depth=24 不匹配，会 BadMatch）
@@ -135,47 +146,31 @@ duk_ret_t paintbrush_initOverlay(duk_context *ctx)
 	/* 设置窗口名称 */
 	XStoreName(overlayDisplay, overlayWindow, "meshcentral-paintbrush");
 
-	/* 设置 _NET_WM_WINDOW_TYPE = _NET_WM_WINDOW_TYPE_NOTIFICATION */
-	wmWindowType = XInternAtom(overlayDisplay, "_NET_WM_WINDOW_TYPE", False);
-	wmTypeNotification = XInternAtom(overlayDisplay, "_NET_WM_WINDOW_TYPE_NOTIFICATION", False);
-	if (wmWindowType != None && wmTypeNotification != None)
-	{
-		XChangeProperty(overlayDisplay, overlayWindow, wmWindowType, XA_ATOM, 32,
-			PropModeReplace, (unsigned char *)&wmTypeNotification, 1);
-	}
+	/* 不设置 _NET_WM_WINDOW_TYPE 和 _NET_WM_STATE —— override_redirect=True 的窗口
+	 * 不需要这些属性，且某些合成器（Deepin-kwin）会对 NOTIFICATION 类型窗口做特殊处理，
+	 * 可能干扰 XShape 输入穿透 */
 
-	/* 保持窗口在最上层 */
-	{
-		Atom netWmState = XInternAtom(overlayDisplay, "_NET_WM_STATE", False);
-		Atom netWmStateAbove = XInternAtom(overlayDisplay, "_NET_WM_STATE_ABOVE", False);
-		if (netWmState != None && netWmStateAbove != None)
-		{
-			XChangeProperty(overlayDisplay, overlayWindow, netWmState, XA_ATOM, 32,
-				PropModeReplace, (unsigned char *)&netWmStateAbove, 1);
-		}
-	}
+	/* 鼠标事件穿透：不接收任何输入事件 */
+	XSelectInput(overlayDisplay, overlayWindow, 0);
 
-	/* 鼠标事件穿透：让 overlay 不拦截任何输入事件 */
+	/* 使用 XShape 扩展让输入穿透（最可靠的方式）
+	 * 注意：XShapeCombineMask(..., None, ShapeSet) 会移除客户端 input shape，
+	 * 使区域恢复为默认的全窗口矩形（仍然阻挡点击）。
+	 * 正确做法：XShapeCombineRectangles + 0 个矩形 = 真正空的 input region */
 	{
-		XSetWindowAttributes inputAttrs;
-		inputAttrs.event_mask = 0; /* 不接收任何事件 */
-		inputAttrs.do_not_propagate_mask = (ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
-		XChangeWindowAttributes(overlayDisplay, overlayWindow,
-			CWEventMask | CWDontPropagate, &inputAttrs);
-	}
-
-	/* 使用 XShape 扩展让输入穿透（最可靠的方式） */
-	{
-		/* XShape 扩展：设置空的 input region，让所有鼠标事件穿透到下层 */
 		int shapeEventBase, shapeErrorBase;
 		if (XShapeQueryExtension(overlayDisplay, &shapeEventBase, &shapeErrorBase))
 		{
-			XShapeCombineMask(overlayDisplay, overlayWindow, ShapeInput, 0, 0, None, ShapeSet);
-		}
-		else
-		{
+			XShapeCombineRectangles(overlayDisplay, overlayWindow, ShapeInput,
+				0, 0, NULL, 0, ShapeSet, Unsorted);
 		}
 	}
+
+	/* 创建 backing pixmap（depth=32，与 overlay 窗口同深度）
+	 * 所有绘图先写到 backing pixmap，flush 时再复制到窗口，
+	 * 避免合成器在错误的 ShapeBounding context 下处理 damage 事件 */
+	overlayBackPixmap = XCreatePixmap(overlayDisplay, overlayWindow,
+		screenWidth, screenHeight, depth);
 
 	/* 创建 GC */
 	gcValues.foreground = 0xFFFF0000; /* ARGB 红色 */
@@ -196,9 +191,54 @@ duk_ret_t paintbrush_initOverlay(duk_context *ctx)
 			GCForeground | GCFunction, &clearGCValues);
 	}
 
+	/* 初始化 backing pixmap 为全透明 */
+	XFillRectangle(overlayDisplay, overlayBackPixmap, overlayClearGC,
+		0, 0, screenWidth, screenHeight);
+
+	/* 创建 ShapeBounding 位图（depth=1），用于控制窗口在合成器场景图中的存在范围 */
+	{
+		XGCValues shapeGCValues;
+		XGCValues shapeClearGCValues;
+
+		shapeBoundingBitmap = XCreatePixmap(overlayDisplay, overlayWindow,
+			screenWidth, screenHeight, 1);
+		/* 绘制GC: foreground=1(窗口存在), line_width=7(比overlay的3宽，确保覆盖) */
+		shapeGCValues.foreground = 1;
+		shapeGCValues.background = 0;
+		shapeGCValues.line_width = 7;
+		shapeGCValues.line_style = LineSolid;
+		shapeGCValues.cap_style = CapRound;
+		shapeGCValues.join_style = JoinRound;
+		shapeBoundingGC = XCreateGC(overlayDisplay, shapeBoundingBitmap,
+			GCForeground | GCBackground | GCLineWidth | GCLineStyle | GCCapStyle | GCJoinStyle,
+			&shapeGCValues);
+		/* 清除GC: foreground=0(窗口不存在) */
+		shapeClearGCValues.foreground = 0;
+		shapeClearGCValues.function = GXcopy;
+		shapeBoundingClearGC = XCreateGC(overlayDisplay, shapeBoundingBitmap,
+			GCForeground | GCFunction, &shapeClearGCValues);
+		/* 初始化为空 bounding shape（全零位图 = 合成器认为没有窗口 = 鼠标穿透） */
+		XFillRectangle(overlayDisplay, shapeBoundingBitmap, shapeBoundingClearGC,
+			0, 0, screenWidth, screenHeight);
+		XShapeCombineMask(overlayDisplay, overlayWindow, ShapeBounding,
+			0, 0, shapeBoundingBitmap, ShapeSet);
+	}
+
 	/* 显示窗口 */
 	XMapWindow(overlayDisplay, overlayWindow);
 	XFlush(overlayDisplay);
+
+	/* MapWindow 后再次设置 ShapeBounding + ShapeInput，防止合成器在映射时重置 */
+	{
+		int shapeEventBase2, shapeErrorBase2;
+		if (XShapeQueryExtension(overlayDisplay, &shapeEventBase2, &shapeErrorBase2))
+		{
+			XShapeCombineMask(overlayDisplay, overlayWindow, ShapeBounding,
+				0, 0, shapeBoundingBitmap, ShapeSet);
+			XShapeCombineRectangles(overlayDisplay, overlayWindow, ShapeInput,
+				0, 0, NULL, 0, ShapeSet, Unsorted);
+		}
+	}
 
 
 	/* 返回尺寸信息 */
@@ -214,18 +254,23 @@ duk_ret_t paintbrush_initOverlay(duk_context *ctx)
    drawLine(x1, y1, x2, y2)
    JS: overlay.drawLine(100, 200, 300, 400)
    ============================================================ */
+/* 将坐标限制在屏幕范围内，防止极端值 */
+#define CLAMP(val, max) ((val) < 0 ? 0 : ((val) > (max) ? (max) : (val)))
+
 duk_ret_t paintbrush_drawLine(duk_context *ctx)
 {
 	int x1, y1, x2, y2;
 
 	if (!overlayDisplay || !overlayGC) return 0;
 
-	x1 = duk_require_int(ctx, 0);
-	y1 = duk_require_int(ctx, 1);
-	x2 = duk_require_int(ctx, 2);
-	y2 = duk_require_int(ctx, 3);
+	x1 = CLAMP(duk_require_int(ctx, 0), screenWidth);
+	y1 = CLAMP(duk_require_int(ctx, 1), screenHeight);
+	x2 = CLAMP(duk_require_int(ctx, 2), screenWidth);
+	y2 = CLAMP(duk_require_int(ctx, 3), screenHeight);
 
-	XDrawLine(overlayDisplay, overlayWindow, overlayGC, x1, y1, x2, y2);
+	XDrawLine(overlayDisplay, overlayBackPixmap, overlayGC, x1, y1, x2, y2);
+	if (shapeBoundingBitmap && shapeBoundingGC)
+		XDrawLine(overlayDisplay, shapeBoundingBitmap, shapeBoundingGC, x1, y1, x2, y2);
 	return 0;
 }
 
@@ -239,14 +284,21 @@ duk_ret_t paintbrush_drawDot(duk_context *ctx)
 
 	if (!overlayDisplay || !overlayGC) return 0;
 
-	x = duk_require_int(ctx, 0);
-	y = duk_require_int(ctx, 1);
+	x = CLAMP(duk_require_int(ctx, 0), screenWidth);
+	y = CLAMP(duk_require_int(ctx, 1), screenHeight);
 	radius = duk_require_int(ctx, 2);
+	if (radius < 1) radius = 1;
+	if (radius > 50) radius = 50;
 
-	XFillArc(overlayDisplay, overlayWindow, overlayGC,
+	XFillArc(overlayDisplay, overlayBackPixmap, overlayGC,
 		x - radius, y - radius,
 		radius * 2, radius * 2,
 		0, 360 * 64);
+	if (shapeBoundingBitmap && shapeBoundingGC)
+		XFillArc(overlayDisplay, shapeBoundingBitmap, shapeBoundingGC,
+			x - radius, y - radius,
+			radius * 2, radius * 2,
+			0, 360 * 64);
 	return 0;
 }
 
@@ -270,60 +322,68 @@ duk_ret_t paintbrush_drawStroke(duk_context *ctx)
 	{
 		duk_get_prop_index(ctx, 0, 0);
 		duk_get_prop_string(ctx, -1, "x");
-		x1 = duk_get_int(ctx, -1);
+		x1 = CLAMP(duk_get_int(ctx, -1), screenWidth);
 		duk_pop(ctx);
 		duk_get_prop_string(ctx, -1, "y");
-		y1 = duk_get_int(ctx, -1);
+		y1 = CLAMP(duk_get_int(ctx, -1), screenHeight);
 		duk_pop_2(ctx);
 
-		XFillArc(overlayDisplay, overlayWindow, overlayGC,
+		XFillArc(overlayDisplay, overlayBackPixmap, overlayGC,
 			x1 - 3, y1 - 3, 6, 6, 0, 360 * 64);
+		if (shapeBoundingBitmap && shapeBoundingGC)
+			XFillArc(overlayDisplay, shapeBoundingBitmap, shapeBoundingGC,
+				x1 - 5, y1 - 5, 10, 10, 0, 360 * 64);
 		return 0;
 	}
 
-	/* 多点 -> 画线段 */
+	/* 多点 -> 画线段 (缓存前一点避免重复读取) */
 	duk_get_prop_index(ctx, 0, 0);
 	duk_get_prop_string(ctx, -1, "x");
-	firstX = duk_get_int(ctx, -1);
+	firstX = CLAMP(duk_get_int(ctx, -1), screenWidth);
 	duk_pop(ctx);
 	duk_get_prop_string(ctx, -1, "y");
-	firstY = duk_get_int(ctx, -1);
+	firstY = CLAMP(duk_get_int(ctx, -1), screenHeight);
 	duk_pop_2(ctx);
 
+	x1 = firstX;
+	y1 = firstY;
 	for (i = 1; i < len; i++)
 	{
 		duk_get_prop_index(ctx, 0, i);
 		duk_get_prop_string(ctx, -1, "x");
-		x2 = duk_get_int(ctx, -1);
+		x2 = CLAMP(duk_get_int(ctx, -1), screenWidth);
 		duk_pop(ctx);
 		duk_get_prop_string(ctx, -1, "y");
-		y2 = duk_get_int(ctx, -1);
+		y2 = CLAMP(duk_get_int(ctx, -1), screenHeight);
 		duk_pop_2(ctx);
 
-		duk_get_prop_index(ctx, 0, i - 1);
-		duk_get_prop_string(ctx, -1, "x");
-		x1 = duk_get_int(ctx, -1);
-		duk_pop(ctx);
-		duk_get_prop_string(ctx, -1, "y");
-		y1 = duk_get_int(ctx, -1);
-		duk_pop_2(ctx);
-
-		XDrawLine(overlayDisplay, overlayWindow, overlayGC, x1, y1, x2, y2);
+		XDrawLine(overlayDisplay, overlayBackPixmap, overlayGC, x1, y1, x2, y2);
+		if (shapeBoundingBitmap && shapeBoundingGC)
+			XDrawLine(overlayDisplay, shapeBoundingBitmap, shapeBoundingGC, x1, y1, x2, y2);
+		x1 = x2;
+		y1 = y2;
 	}
 
 	duk_get_prop_index(ctx, 0, len - 1);
 	duk_get_prop_string(ctx, -1, "x");
-	lastX = duk_get_int(ctx, -1);
+	lastX = CLAMP(duk_get_int(ctx, -1), screenWidth);
 	duk_pop(ctx);
 	duk_get_prop_string(ctx, -1, "y");
-	lastY = duk_get_int(ctx, -1);
+	lastY = CLAMP(duk_get_int(ctx, -1), screenHeight);
 	duk_pop_2(ctx);
 
 	/* 端点圆 */
-	XFillArc(overlayDisplay, overlayWindow, overlayGC,
+	XFillArc(overlayDisplay, overlayBackPixmap, overlayGC,
 		firstX - 3, firstY - 3, 6, 6, 0, 360 * 64);
-	XFillArc(overlayDisplay, overlayWindow, overlayGC,
+	XFillArc(overlayDisplay, overlayBackPixmap, overlayGC,
 		lastX - 3, lastY - 3, 6, 6, 0, 360 * 64);
+	if (shapeBoundingBitmap && shapeBoundingGC)
+	{
+		XFillArc(overlayDisplay, shapeBoundingBitmap, shapeBoundingGC,
+			firstX - 5, firstY - 5, 10, 10, 0, 360 * 64);
+		XFillArc(overlayDisplay, shapeBoundingBitmap, shapeBoundingGC,
+			lastX - 5, lastY - 5, 10, 10, 0, 360 * 64);
+	}
 
 	return 0;
 }
@@ -336,9 +396,20 @@ duk_ret_t paintbrush_clearWindow(duk_context *ctx)
 {
 	if (!overlayDisplay || !overlayWindow) return 0;
 	if (!overlayClearGC) return 0;
-	/* 用全透明像素填充整个窗口（XClearWindow 对 background_pixmap=None 无效） */
+	/* 清除 backing pixmap */
+	if (overlayBackPixmap)
+		XFillRectangle(overlayDisplay, overlayBackPixmap, overlayClearGC,
+			0, 0, screenWidth, screenHeight);
+	/* 清除 overlay 窗口 */
 	XFillRectangle(overlayDisplay, overlayWindow, overlayClearGC,
 		0, 0, screenWidth, screenHeight);
+	/* 同时清除 ShapeBounding 位图 */
+	if (shapeBoundingBitmap && shapeBoundingClearGC) {
+		XFillRectangle(overlayDisplay, shapeBoundingBitmap, shapeBoundingClearGC,
+			0, 0, screenWidth, screenHeight);
+		XShapeCombineMask(overlayDisplay, overlayWindow, ShapeBounding,
+			0, 0, shapeBoundingBitmap, ShapeSet);
+	}
 	return 0;
 }
 
@@ -349,6 +420,16 @@ duk_ret_t paintbrush_clearWindow(duk_context *ctx)
 duk_ret_t paintbrush_flush(duk_context *ctx)
 {
 	if (!overlayDisplay) return 0;
+	/* 1. 先更新 ShapeBounding（让合成器知道窗口存在范围） */
+	if (shapeBoundingBitmap)
+		XShapeCombineMask(overlayDisplay, overlayWindow, ShapeBounding,
+			0, 0, shapeBoundingBitmap, ShapeSet);
+	/* 2. 从 backing pixmap 复制到 overlay 窗口
+	 *    此时 bounding shape 已设置，damage 会在正确的 bounding context 下被合成器处理 */
+	if (overlayBackPixmap)
+		XCopyArea(overlayDisplay, overlayBackPixmap, overlayWindow, overlayGC,
+			0, 0, screenWidth, screenHeight, 0, 0);
+	/* 3. 刷新 */
 	XFlush(overlayDisplay);
 	return 0;
 }
@@ -361,8 +442,13 @@ duk_ret_t paintbrush_destroy(duk_context *ctx)
 {
 	if (overlayDisplay != NULL)
 	{
+		if (shapeBoundingGC) { XFreeGC(overlayDisplay, shapeBoundingGC); shapeBoundingGC = 0; }
+		if (shapeBoundingClearGC) { XFreeGC(overlayDisplay, shapeBoundingClearGC); shapeBoundingClearGC = 0; }
+		if (shapeBoundingBitmap) { XFreePixmap(overlayDisplay, shapeBoundingBitmap); shapeBoundingBitmap = 0; }
+			if (overlayBackPixmap) { XFreePixmap(overlayDisplay, overlayBackPixmap); overlayBackPixmap = 0; }
 		if (overlayGC) { XFreeGC(overlayDisplay, overlayGC); overlayGC = 0; }
 		if (overlayClearGC) { XFreeGC(overlayDisplay, overlayClearGC); overlayClearGC = 0; }
+		if (overlayColormap) { XFreeColormap(overlayDisplay, overlayColormap); overlayColormap = 0; }
 		if (overlayWindow) { XDestroyWindow(overlayDisplay, overlayWindow); overlayWindow = 0; }
 		XCloseDisplay(overlayDisplay);
 		overlayDisplay = NULL;
