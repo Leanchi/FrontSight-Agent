@@ -42,6 +42,7 @@ limitations under the License.
 #include "microstack/ILibMulticastSocket.h"
 #include "microscript/ILibDuktape_ScriptContainer.h"
 #include "../microstack/ILibIPAddressMonitor.h"
+#include "paintbrush_overlay.h"
 
 #ifdef _POSIX
 #include <sys/stat.h>
@@ -2092,6 +2093,7 @@ void ILibDuktape_MeshAgent_Init(duk_context* ctx, void *chain, MeshAgentHostCont
 	duk_put_prop_string(ctx, -2, "MeshAgentPtr");	// [stash]
 	duk_pop(ctx);									// ...
 	ILibDuktape_ModSearch_AddHandler(ctx, "MeshAgent", ILibDuktape_MeshAgent_PUSH);
+	ILibDuktape_ModSearch_AddHandler(ctx, "paintbrush-overlay", paintbrush_overlay_PUSH);
 }
 
 /* ------------------------------ 
@@ -5931,6 +5933,7 @@ void MeshAgent_ScriptMode(MeshAgentHostContainer *agentHost, int argc, char **ar
 		duk_put_prop_string(agentHost->meshCoreCtx, -2, "\xFF_MeshDesktop_AgentPtr");	// [stash]
 		duk_pop(agentHost->meshCoreCtx);												// ...
 		ILibDuktape_ModSearch_AddHandler(agentHost->meshCoreCtx, "meshDesktop", MeshAgent_ScriptMode_MeshDesktop_PUSH);
+		ILibDuktape_ModSearch_AddHandler(agentHost->meshCoreCtx, "paintbrush-overlay", paintbrush_overlay_PUSH);
 
 		duk_push_global_object(agentHost->meshCoreCtx);									// [g]
 		duk_push_c_function(agentHost->meshCoreCtx, MeshAgent_ScriptMode_StartAgent, 0);// [g][startAgent]

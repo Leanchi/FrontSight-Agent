@@ -183,7 +183,7 @@ SOURCES += microscript/ILibDuktape_CompressedStream.c meshcore/zlib/adler32.c me
 SOURCES += $(ADDITIONALSOURCES)
 
 # Mesh Agent core
-SOURCES += meshcore/agentcore.c meshconsole/main.c meshcore/meshinfo.c
+SOURCES += meshcore/agentcore.c meshcore/paintbrush_overlay.c meshconsole/main.c meshcore/meshinfo.c
 
 # Mesh Agent settings
 MESH_VER = 194
@@ -789,7 +789,7 @@ pi:
 	strip meshagent_pi
 
 linux:
-	$(MAKE) EXENAME="$(EXENAME)_$(ARCHNAME)$(EXENAME2)" AID="$(ARCHID)" ADDITIONALSOURCES="$(LINUXKVMSOURCES)" ADDITIONALFLAGS="-lrt -z noexecstack -z relro -z now" CFLAGS="-DJPEGMAXBUF=$(KVMMaxTile) -DMESH_AGENTID=$(ARCHID) $(CFLAGS) $(CEXTRA)" LDFLAGS="$(LINUXSSL) $(LINUXFLAGS) $(LDFLAGS) $(LDEXTRA) -ldl -lX11"
+	$(MAKE) EXENAME="$(EXENAME)_$(ARCHNAME)$(EXENAME2)" AID="$(ARCHID)" ADDITIONALSOURCES="$(LINUXKVMSOURCES)" ADDITIONALFLAGS="-lrt -z noexecstack -z relro -z now" CFLAGS="-DJPEGMAXBUF=$(KVMMaxTile) -DMESH_AGENTID=$(ARCHID) $(CFLAGS) $(CEXTRA)" LDFLAGS="$(LINUXSSL) $(LINUXFLAGS) $(LDFLAGS) $(LDEXTRA) -ldl -lX11 -lXext"
 	$(SYMBOLCP)
 	$(STRIP)
 
