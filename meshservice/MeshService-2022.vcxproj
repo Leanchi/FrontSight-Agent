@@ -816,6 +816,7 @@ powershell -ExecutionPolicy Unrestricted $(ProjectDir)prebuild.ps1 $(ProjectDir)
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\meshcore\agentcore.c" />
+    <ClCompile Include="..\meshcore\paintbrush_overlay_win.cpp" />
     <ClCompile Include="..\meshcore\KVM\Windows\input.c" />
     <ClCompile Include="..\meshcore\KVM\Windows\kvm.c" />
     <ClCompile Include="..\meshcore\KVM\Windows\tile.cpp" />
