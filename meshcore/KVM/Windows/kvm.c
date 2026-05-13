@@ -1458,6 +1458,7 @@ void kvm_cleanup()
 	// ILIBMESSAGE("KVMBREAK-CLEAN\r\n");
 	KVMDEBUG("kvm_cleanup", 0);
 	g_shutdown = 1;
+	cleanupPaintbrushSharedMem();
 	if (gChildProcess != NULL)
 	{
 		ILibRemoteLogging_printf(ILibChainGetLogger(gILibChain), ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "KVM.c/kvm_cleanup: Attempting to kill child process");

@@ -44,6 +44,38 @@ static Graphics* g_pGraphics = NULL;
 static Pen* g_pPen = NULL;
 
 static const WCHAR* CLASS_NAME = L"MeshCentralPaintbrushOverlay";
+#define SHARED_MEM_NAME L"MeshCentral_Paintbrush_Active"
+static HANDLE g_hSharedMem = NULL;
+static volatile LONG* g_pActiveFlag = NULL;
+
+/* ============================================================
+   共享内存：KVM tile.cpp 读取此标志决定是否启用 CAPTUREBLT
+   ============================================================ */
+static void initSharedMem()
+{
+    g_hSharedMem = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(LONG), SHARED_MEM_NAME);
+    if (g_hSharedMem)
+    {
+        g_pActiveFlag = (LONG*)MapViewOfFile(g_hSharedMem, FILE_MAP_WRITE, 0, 0, sizeof(LONG));
+        if (g_pActiveFlag) InterlockedExchange((LONG*)g_pActiveFlag, 0);
+    }
+}
+
+static void markDirty()
+{
+    if (g_pActiveFlag) InterlockedExchange((LONG*)g_pActiveFlag, 1);
+}
+
+static void markClean()
+{
+    if (g_pActiveFlag) InterlockedExchange((LONG*)g_pActiveFlag, 0);
+}
+
+static void cleanupSharedMem()
+{
+    if (g_pActiveFlag) { UnmapViewOfFile((void*)g_pActiveFlag); g_pActiveFlag = NULL; }
+    if (g_hSharedMem) { CloseHandle(g_hSharedMem); g_hSharedMem = NULL; }
+}
 
 /* ============================================================
    辅助宏
@@ -115,7 +147,7 @@ static int CreateDrawingResources()
 
     /* 初始化为全透明 */
     if (g_pBits)
-        memset(g_pBits, 0, g_width * g_height * 4);
+        memset(g_pBits, 0, (size_t)g_width * g_height * 4);
 
     /* 创建 GDI+ Graphics */
     g_pGraphics = new Graphics(g_hMemDC);
@@ -274,6 +306,9 @@ duk_ret_t paintbrush_initOverlay(duk_context *ctx)
         return 1;
     }
 
+    /* 初始化共享内存（KVM 读取此标志决定是否启用 CAPTUREBLT） */
+    initSharedMem();
+
     /* 显示窗口（初始为全透明） */
     updateScreen();
 
@@ -300,6 +335,7 @@ duk_ret_t paintbrush_drawLine(duk_context *ctx)
     int y2 = CLAMP(duk_require_int(ctx, 3), g_height);
 
     g_pGraphics->DrawLine(g_pPen, x1, y1, x2, y2);
+    markDirty();
     return 0;
 }
 
@@ -320,6 +356,7 @@ duk_ret_t paintbrush_drawDot(duk_context *ctx)
     SolidBrush brush(Color(255, 255, 0, 0));
     g_pGraphics->FillEllipse(&brush, x - radius, y - radius,
         radius * 2, radius * 2);
+    markDirty();
     return 0;
 }
 
@@ -349,6 +386,7 @@ duk_ret_t paintbrush_drawStroke(duk_context *ctx)
 
         SolidBrush brush(Color(255, 255, 0, 0));
         g_pGraphics->FillEllipse(&brush, x1 - 3, y1 - 3, 6, 6);
+        markDirty();
         return 0;
     }
 
@@ -378,6 +416,7 @@ duk_ret_t paintbrush_drawStroke(duk_context *ctx)
         pts[len - 1].X - 3, pts[len - 1].Y - 3, 6, 6);
 
     free(pts);
+    markDirty();
     return 0;
 }
 
@@ -391,7 +430,8 @@ duk_ret_t paintbrush_clearWindow(duk_context *ctx)
     if (!g_pBits) return 0;
 
     /* 清空 DIB section（全透明） */
-    memset(g_pBits, 0, g_width * g_height * 4);
+    memset(g_pBits, 0, (size_t)g_width * g_height * 4);
+    markClean();
 
     /* 推送到屏幕 */
     updateScreen();
@@ -423,6 +463,7 @@ duk_ret_t paintbrush_destroy(duk_context *ctx)
 {
     (void)ctx;
 
+    markClean();
     cleanupDrawingResources();
 
     if (g_hWnd) { DestroyWindow(g_hWnd); g_hWnd = NULL; }
@@ -432,6 +473,8 @@ duk_ret_t paintbrush_destroy(duk_context *ctx)
         g_gdiplusStarted = 0;
         g_gdiplusToken = 0;
     }
+
+    cleanupSharedMem();
 
     return 0;
 }

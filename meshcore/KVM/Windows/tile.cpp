@@ -75,6 +75,29 @@ EncoderParameters encParam;
 LPVOID tilebuffer = NULL;
 unsigned int tilebuffersize = 0;
 
+/* Paintbrush overlay 共享内存缓存——读取 overlay 活动标志决定是否启用 CAPTUREBLT */
+static HANDLE g_hPaintbrushMap = NULL;
+static volatile LONG* g_pPaintbrushFlag = NULL;
+#define PAINTBRUSH_SHARED_MEM_NAME L"MeshCentral_Paintbrush_Active"
+
+static int isPaintbrushActive()
+{
+    if (!g_hPaintbrushMap)
+    {
+        g_hPaintbrushMap = OpenFileMappingW(FILE_MAP_READ, FALSE, PAINTBRUSH_SHARED_MEM_NAME);
+        if (!g_hPaintbrushMap) return 0;
+        g_pPaintbrushFlag = (LONG*)MapViewOfFile(g_hPaintbrushMap, FILE_MAP_READ, 0, 0, sizeof(LONG));
+        if (!g_pPaintbrushFlag) { CloseHandle(g_hPaintbrushMap); g_hPaintbrushMap = NULL; return 0; }
+    }
+    return (*g_pPaintbrushFlag != 0) ? 1 : 0;
+}
+
+void cleanupPaintbrushSharedMem()
+{
+    if (g_pPaintbrushFlag) { UnmapViewOfFile((void*)g_pPaintbrushFlag); g_pPaintbrushFlag = NULL; }
+    if (g_hPaintbrushMap) { CloseHandle(g_hPaintbrushMap); g_hPaintbrushMap = NULL; }
+}
+
 // Used to obtain the GUID for the image encoder.
 int GetEncoderClsid(const WCHAR* format, CLSID* pClsid)
 {
@@ -497,7 +520,8 @@ int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove)
 	if (SelectObject(hCaptureDC, hCapturedBitmap) == NULL) { KVMDEBUG("SelectObject() failed", 0); return(1); }
 	if (SCALING_FACTOR == 1024)
 	{
-		if (BitBlt(hCaptureDC, 0, 0, adjust_screen_size(SCREEN_WIDTH), adjust_screen_size(SCREEN_HEIGHT), hDesktopDC, SCREEN_X, SCREEN_Y, SRCCOPY) == FALSE)
+		DWORD rop = isPaintbrushActive() ? (SRCCOPY | CAPTUREBLT) : SRCCOPY;
+		if (BitBlt(hCaptureDC, 0, 0, adjust_screen_size(SCREEN_WIDTH), adjust_screen_size(SCREEN_HEIGHT), hDesktopDC, SCREEN_X, SCREEN_Y, rop) == FALSE)
 		{
 			KVMDEBUG("BitBlt() returned FALSE", 0);
 			return 1; // If the copy fails, error out.
@@ -536,7 +560,7 @@ int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove)
 	else
 	{
 		if (SetStretchBltMode(hCaptureDC, HALFTONE) == 0) { KVMDEBUG("SetStretchBltMode() failed", 0); return(1); }
-		if (StretchBlt(hCaptureDC, 0, 0, adjust_screen_size(SCALED_WIDTH), adjust_screen_size(SCALED_HEIGHT), hDesktopDC, SCREEN_X, SCREEN_Y, adjust_screen_size(SCREEN_WIDTH), adjust_screen_size(SCREEN_HEIGHT), SRCCOPY) == FALSE)
+		if (StretchBlt(hCaptureDC, 0, 0, adjust_screen_size(SCALED_WIDTH), adjust_screen_size(SCALED_HEIGHT), hDesktopDC, SCREEN_X, SCREEN_Y, adjust_screen_size(SCREEN_WIDTH), adjust_screen_size(SCREEN_HEIGHT), isPaintbrushActive() ? (SRCCOPY | CAPTUREBLT) : SRCCOPY) == FALSE)
 		{
 			KVMDEBUG("StretchBlt() returned FALSE", 0);
 			return 1; // If the copy fails, error out.
