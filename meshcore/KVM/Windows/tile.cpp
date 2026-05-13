@@ -78,7 +78,9 @@ unsigned int tilebuffersize = 0;
 /* Paintbrush overlay 共享内存缓存——读取 overlay 活动标志决定是否启用 CAPTUREBLT */
 static HANDLE g_hPaintbrushMap = NULL;
 static volatile LONG* g_pPaintbrushFlag = NULL;
+static int g_paintbrushCheckCounter = 0;
 #define PAINTBRUSH_SHARED_MEM_NAME L"MeshCentral_Paintbrush_Active"
+#define PAINTBRUSH_WINDOW_CLASS L"MeshCentralPaintbrushOverlay"
 
 static int isPaintbrushActive()
 {
@@ -89,7 +91,15 @@ static int isPaintbrushActive()
         g_pPaintbrushFlag = (LONG*)MapViewOfFile(g_hPaintbrushMap, FILE_MAP_READ, 0, 0, sizeof(LONG));
         if (!g_pPaintbrushFlag) { CloseHandle(g_hPaintbrushMap); g_hPaintbrushMap = NULL; return 0; }
     }
-    return (*g_pPaintbrushFlag != 0) ? 1 : 0;
+    if (*g_pPaintbrushFlag == 0) return 0;
+    /* 标志为 1 时，每 60 帧检查 overlay 窗口是否仍存在（防止 overlay 崩溃后标志残留） */
+    g_paintbrushCheckCounter++;
+    if (g_paintbrushCheckCounter >= 60)
+    {
+        g_paintbrushCheckCounter = 0;
+        if (FindWindowW(PAINTBRUSH_WINDOW_CLASS, NULL) == NULL) return 0;
+    }
+    return 1;
 }
 
 void cleanupPaintbrushSharedMem()
