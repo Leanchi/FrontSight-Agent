@@ -1,18 +1,74 @@
-# MeshCentral Agent
+# FrontSight Agent
+
+> FrontSight（一线视联）定制分支，基于上游 [Ylianst/MeshAgent](https://github.com/Ylianst/MeshAgent)
 
 ## Table of Contents
 
 [About](#about)  
+[FrontSight 定制功能](#frontsight-定制功能)  
+[编译](#编译)  
 [Social Media](#social-media)  
 [MSH format](#msh-format)  
 [Self Test](#self-test)  
 [Feedback](#feedback)  
 [License](#license)
+
 ## About
 
 The MeshCentral Agent is the software that runs on remote devices and connects to the MeshCentral server to allow for remote device management. This agent is compiled for Windows, many different Linux distributions, macOS and FreeBSD. In addition compiled for many different processors x86-32, x86-64, ARM, MIPS. For most users, install the MeshCentral server first and install the agent from your server.
 
 For more information, [visit MeshCentral.com](https://www.meshcentral.com).
+
+## FrontSight 定制功能
+
+本分支在 MeshAgent 上游基础上增加了以下定制：
+
+### 红点画笔标注（Paintbrush Overlay）
+
+远程桌面会话中，操作员在浏览器绘制红色标注，标注实时渲染在目标机器桌面的透明浮层上。
+
+| 平台 | 实现方式 | 核心文件 |
+|------|---------|---------|
+| Linux (X11) | ARGB overlay + XShape 穿透 | `meshcore/paintbrush_overlay.c` |
+| Windows | WS_EX_LAYERED + GDI+ 绘图 | `meshcore/paintbrush_overlay_win.cpp` |
+
+两端通过 Duktape 注册为 `"paintbrush-overlay"` 模块，JS 通过 `require()` 调用，API 完全一致。
+
+### 窗口虚化（KVM 隐私保护）
+
+远程桌面中自动虚化匹配关键字的窗口区域（灰色遮盖），保护隐私信息。
+
+| 平台 | 实现文件 |
+|------|---------|
+| macOS | `meshcore/KVM/MacOS/mac_kvm.c`, `mac_tile.c` |
+| Linux | `meshcore/KVM/Linux/linux_blur.c`, `linux_kvm.c`, `linux_tile.c` |
+| 共享配置 | `meshcore/KVM/blur_config.h`（`BLUR_KEYWORDS[]` 数组） |
+
+### Intel AMT 移除
+
+彻底删除 Intel AMT 主动管理技术相关代码（`amt_*` 模块和前端），通过 `agentcore.c` 中 `amtIsDisabledByXjm = true` 运行时开关实现。
+
+## 编译
+
+### Linux / macOS / BSD
+```bash
+make linux ARCHID=6     # Linux x86_64
+make macos ARCHID=29    # macOS ARM64
+```
+详见 `makefile` 头部注释，支持 30+ 平台。
+
+### Windows
+使用 **Visual Studio 2022** 打开 `MeshAgent-2022.sln`：
+1. 选择配置 **Release** + **x64**
+2. 生成 **MeshService-2022**（服务进程）和 **MeshConsole-2022**（控制台进程）
+3. 产物：`x64/Release/MeshService64.exe`、`MeshConsole64.exe`
+
+### macOS 交叉编译验证（MinGW）
+```bash
+brew install mingw-w64
+bash build-win64.sh          # 语法检查，不产生完整 .exe
+docker build -f docker-build-agent/Dockerfile.mingw -t meshagent-mingw .
+```
 
 ## Social Media
 [YouTube](https://www.youtube.com/channel/UCJWz607A8EVlkilzcrb-GKg/videos)  
