@@ -1,0 +1,46 @@
+name: Build Windows Executables
+
+on:
+  push:
+    branches: [ "main", "master" ] # 当你把代码 push 到主分支时自动触发
+  workflow_dispatch: # 这是一个神仙指令，允许你在 GitHub 网页上手动点击按钮触发编译
+
+jobs:
+  build:
+    runs-on: windows-2022 # 相当于在云端免费开了一台装有 VS2022 的 Windows 虚拟机
+
+    steps:
+    # 1. 准备代码 (把你的代码拉取到云端的 Windows 环境里)
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # 2. 准备 VS2022 编译环境 (相当于安装 C++ 桌面开发工作负载)
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Setup MSVC (为了让你能用 dumpbin 命令)
+      uses: ilammy/msvc-dev-cmd@v1
+
+    # 3. 编译 MeshService (对应你原本的 VS 生成操作)
+    - name: Build MeshService-2022
+      run: |
+        msbuild meshagent/MeshAgent/MeshAgent-2022.sln /p:Configuration=Release /p:Platform=x64 /t:MeshService-2022
+        
+    # 3. 编译 MeshConsole
+    - name: Build MeshConsole-2022
+      run: |
+        msbuild meshagent/MeshAgent/MeshAgent-2022.sln /p:Configuration=Release /p:Platform=x64 /t:MeshConsole-2022
+
+    # 5. 验证编译成功 (在云端直接运行 dumpbin，如果找不到 paintbrush 会报错，帮你自动把关)
+    - name: Verify paintbrush module
+      run: |
+        dumpbin /SYMBOLS meshagent\MeshAgent\x64\Release\MeshService64.exe | findstr paintbrush
+
+    # 4. 打包产物 (把你需要的 .exe 提取出来，供你在 Mac 上下载)
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: MeshAgent-Windows-Binaries # 下载下来的压缩包叫这个名字
+        path: |
+          meshagent/MeshAgent/x64/Release/MeshService64.exe
+          meshagent/MeshAgent/x64/Release/MeshConsole64.exe
