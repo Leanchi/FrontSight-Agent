@@ -16,8 +16,8 @@ Copyright 2026 红点画笔 C 原生模块 (Windows 版本)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "duktape.h"
-#include "microscript/ILibDuktape_Helpers.h"
+#include "../microscript/duktape.h"
+#include "../microscript/ILibDuktape_Helpers.h"
 
 #pragma comment(lib, "gdiplus.lib")
 
