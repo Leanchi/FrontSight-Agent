@@ -1,0 +1,54 @@
+name: Build Windows Agent
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build MeshService (x64)
+        run: |
+          msbuild MeshAgent-2022.sln `
+            /t:MeshService-2022 `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /m
+
+      - name: Build MeshConsole (x64)
+        run: |
+          msbuild MeshAgent-2022.sln `
+            /t:MeshConsole-2022 `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /m
+
+      - name: Collect artifacts
+        run: |
+          mkdir artifacts
+          Get-ChildItem -Recurse -Path Release -Filter *.exe | ForEach-Object {
+            Copy-Item $_.FullName -Destination artifacts/
+          }
+
+      - name: Upload MeshService64
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeshService64
+          path: artifacts/MeshService-2022.exe
+
+      - name: Upload MeshConsole64
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeshConsole64
+          path: artifacts/MeshConsole-2022.exe
