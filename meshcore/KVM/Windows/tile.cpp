@@ -62,6 +62,19 @@ extern int FRAME_RATE_TIMER;
 extern tileInfo_t **tileInfo;
 }
 
+/* 检查 paintbrush overlay 是否活跃（通过 Named Shared Memory 跨进程通信）
+ * 只在 overlay 活跃时加 CAPTUREBLT，避免无 overlay 时 DWM 帧间抖动导致 CRC 抖动 */
+static int isPaintbrushActive()
+{
+    HANDLE h = OpenFileMappingW(FILE_MAP_READ, FALSE, L"MeshCentralPaintbrushActive");
+    if (!h) return 0;
+    volatile LONG* flag = (volatile LONG*)MapViewOfFile(h, FILE_MAP_READ, 0, 0, sizeof(LONG));
+    int result = (flag && *flag) ? 1 : 0;
+    if (flag) UnmapViewOfFile((void*)flag);
+    CloseHandle(h);
+    return result;
+}
+
 // Used with setting up a GDI+ session.
 GdiplusStartupInput gdiplusStartupInput;
 ULONG_PTR gdiplusToken;
@@ -497,7 +510,7 @@ int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove)
 	if (SelectObject(hCaptureDC, hCapturedBitmap) == NULL) { KVMDEBUG("SelectObject() failed", 0); return(1); }
 	if (SCALING_FACTOR == 1024)
 	{
-		if (BitBlt(hCaptureDC, 0, 0, adjust_screen_size(SCREEN_WIDTH), adjust_screen_size(SCREEN_HEIGHT), hDesktopDC, SCREEN_X, SCREEN_Y, SRCCOPY | CAPTUREBLT) == FALSE)
+		if (BitBlt(hCaptureDC, 0, 0, adjust_screen_size(SCREEN_WIDTH), adjust_screen_size(SCREEN_HEIGHT), hDesktopDC, SCREEN_X, SCREEN_Y, SRCCOPY | (isPaintbrushActive() ? CAPTUREBLT : 0)) == FALSE)
 		{
 			KVMDEBUG("BitBlt() returned FALSE", 0);
 			return 1; // If the copy fails, error out.
@@ -536,7 +549,7 @@ int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove)
 	else
 	{
 		if (SetStretchBltMode(hCaptureDC, HALFTONE) == 0) { KVMDEBUG("SetStretchBltMode() failed", 0); return(1); }
-		if (StretchBlt(hCaptureDC, 0, 0, adjust_screen_size(SCALED_WIDTH), adjust_screen_size(SCALED_HEIGHT), hDesktopDC, SCREEN_X, SCREEN_Y, adjust_screen_size(SCREEN_WIDTH), adjust_screen_size(SCREEN_HEIGHT), SRCCOPY | CAPTUREBLT) == FALSE)
+		if (StretchBlt(hCaptureDC, 0, 0, adjust_screen_size(SCALED_WIDTH), adjust_screen_size(SCALED_HEIGHT), hDesktopDC, SCREEN_X, SCREEN_Y, adjust_screen_size(SCREEN_WIDTH), adjust_screen_size(SCREEN_HEIGHT), SRCCOPY | (isPaintbrushActive() ? CAPTUREBLT : 0)) == FALSE)
 		{
 			KVMDEBUG("StretchBlt() returned FALSE", 0);
 			return 1; // If the copy fails, error out.
