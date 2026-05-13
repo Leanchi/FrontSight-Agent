@@ -332,7 +332,7 @@ duk_ret_t paintbrush_drawStroke(duk_context *ctx)
     if (!g_pGraphics || !g_pPen) return 0;
     if (!duk_is_array(ctx, 0)) return 0;
 
-    int len = duk_get_length(ctx, 0);
+    duk_size_t len = duk_get_length(ctx, 0);
     if (len == 0) return 0;
 
     /* 单点 -> 画圆 */
@@ -355,7 +355,7 @@ duk_ret_t paintbrush_drawStroke(duk_context *ctx)
     Point* pts = (Point*)malloc(len * sizeof(Point));
     if (!pts) return 0;
 
-    for (int i = 0; i < len; i++)
+    for (duk_size_t i = 0; i < len; i++)
     {
         duk_get_prop_index(ctx, 0, i);
         duk_get_prop_string(ctx, -1, "x");
