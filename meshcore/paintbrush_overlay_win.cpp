@@ -45,29 +45,6 @@ static Pen* g_pPen = NULL;
 
 static const WCHAR* CLASS_NAME = L"MeshCentralPaintbrushOverlay";
 
-/* Overlay 活跃标志（Named Shared Memory，跨进程共享）
- * KVM tile.cpp 读取此标志决定是否加 CAPTUREBLT，
- * 避免无 overlay 时 CAPTUREBLT 引起 DWM 帧间抖动导致 CRC 抖动 */
-static HANDLE g_hSharedFlag = NULL;
-static volatile LONG* g_pSharedFlag = NULL;
-#define SHARED_FLAG_NAME L"MeshCentralPaintbrushActive"
-
-static void setOverlayActiveFlag(int active)
-{
-    if (!g_hSharedFlag)
-    {
-        g_hSharedFlag = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
-            PAGE_READWRITE, 0, sizeof(LONG), SHARED_FLAG_NAME);
-        if (g_hSharedFlag)
-        {
-            g_pSharedFlag = (volatile LONG*)MapViewOfFile(g_hSharedFlag,
-                FILE_MAP_ALL_ACCESS, 0, 0, sizeof(LONG));
-        }
-    }
-    if (g_pSharedFlag)
-        InterlockedExchange((LONG*)g_pSharedFlag, active ? 1 : 0);
-}
-
 /* ============================================================
    辅助宏
    ============================================================ */
@@ -300,9 +277,6 @@ duk_ret_t paintbrush_initOverlay(duk_context *ctx)
     /* 显示窗口（初始为全透明） */
     updateScreen();
 
-    /* 设置跨进程活跃标志，让 KVM tile.cpp 知道需要加 CAPTUREBLT */
-    setOverlayActiveFlag(1);
-
     /* 返回尺寸 */
     duk_push_object(ctx);
     duk_push_int(ctx, g_width);
@@ -450,11 +424,6 @@ duk_ret_t paintbrush_destroy(duk_context *ctx)
     (void)ctx;
 
     cleanupDrawingResources();
-
-    /* 清除活跃标志 */
-    setOverlayActiveFlag(0);
-    if (g_pSharedFlag) { UnmapViewOfFile((void*)g_pSharedFlag); g_pSharedFlag = NULL; }
-    if (g_hSharedFlag) { CloseHandle(g_hSharedFlag); g_hSharedFlag = NULL; }
 
     if (g_hWnd) { DestroyWindow(g_hWnd); g_hWnd = NULL; }
 
