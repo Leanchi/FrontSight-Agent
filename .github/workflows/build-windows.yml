@@ -49,8 +49,8 @@ jobs:
           name: MeshService64
           path: artifacts/MeshService64.exe
 
-      - name: Upload MeshConsole
+      - name: Upload MeshConsole64
         uses: actions/upload-artifact@v4
         with:
-          name: MeshConsole
-          path: artifacts/MeshConsole.exe
+          name: MeshConsole64
+          path: artifacts/MeshConsole64.exe
