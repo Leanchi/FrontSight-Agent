@@ -317,7 +317,10 @@ duk_ret_t paintbrush_initOverlay(duk_context *ctx)
     /* 初始化共享内存（KVM 读取此标志决定是否启用 CAPTUREBLT） */
     initSharedMem();
 
-    /* 显示窗口（初始为全透明） */
+    /* 显示窗口：WS_EX_LAYERED 窗口必须调用 ShowWindow 才会出现在桌面 */
+    ShowWindow(g_hWnd, SW_SHOWNOACTIVATE);
+
+    /* 设置初始内容（全透明） */
     updateScreen();
 
     /* 返回尺寸 */
