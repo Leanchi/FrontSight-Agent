@@ -1124,10 +1124,11 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 					height = TILE_HEIGHT * row;
 					width = TILE_WIDTH * col;
 
-					while (!g_shutdown && (g_pause))
+					if (!g_shutdown && (g_pause))
 					{
-						Sleep(50); /*printf(".");*/
-					} // If the socket is in pause state, wait here. //ToDo: YLIAN!!!!
+						Sleep(100);
+						g_pause = 0;
+					}
 
 					if (g_shutdown || SCALING_FACTOR != SCALING_FACTOR_NEW)
 					{

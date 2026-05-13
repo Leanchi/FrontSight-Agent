@@ -606,8 +606,9 @@ int wmain(int argc, char* wargv[])
 		integratedJavaScript = ILibString_Copy(argv[2], 0);
 		integragedJavaScriptLen = (int)strnlen_s(integratedJavaScript, sizeof(ILibScratchPad));
 	}
-	if (argc > 2 && strcmp(argv[1], "-b64exec") == 0 && integragedJavaScriptLen == 0)
+	if (argc > 2 && strcmp(argv[1], "-b64exec") == 0)
 	{
+		if (integratedJavaScript != NULL) { ILibMemory_Free(integratedJavaScript); integratedJavaScript = NULL; }
 		integragedJavaScriptLen = ILibBase64Decode((unsigned char *)argv[2], (const int)strnlen_s(argv[2], sizeof(ILibScratchPad2)), (unsigned char**)&integratedJavaScript);
 	}
 	if (argc > 1 && strcasecmp(argv[1], "-nodeid") == 0)
