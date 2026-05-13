@@ -172,6 +172,9 @@ static void updateScreen()
 {
     if (!g_hWnd || !g_hMemDC) return;
 
+    /* 刷新 GDI+ 缓冲，确保绘图操作写入 DIB */
+    if (g_pGraphics) g_pGraphics->Flush(Gdiplus::FlushIntentionSync);
+
     HDC hScreenDC = GetDC(NULL);
     if (!hScreenDC) return;
 
@@ -180,8 +183,13 @@ static void updateScreen()
     SIZE sizeWnd = { g_width, g_height };
     POINT ptDst = { g_offsetX, g_offsetY };
 
-    UpdateLayeredWindow(g_hWnd, hScreenDC, &ptDst, &sizeWnd,
+    BOOL ok = UpdateLayeredWindow(g_hWnd, hScreenDC, &ptDst, &sizeWnd,
         g_hMemDC, &ptSrc, 0, &blend, ULW_ALPHA);
+    if (!ok)
+    {
+        printf("paintbrush-overlay: UpdateLayeredWindow FAILED, err=%lu\n", GetLastError());
+        fflush(stdout);
+    }
 
     /* 确保窗口在最顶层 */
     SetWindowPos(g_hWnd, HWND_TOPMOST, 0, 0, 0, 0,
@@ -449,6 +457,23 @@ duk_ret_t paintbrush_flush(duk_context *ctx)
 
     /* 检查分辨率变化 */
     checkScreenChange();
+
+    /* 诊断：检查 DIB 是否有非零像素 */
+    if (g_pBits && g_width > 0 && g_height > 0)
+    {
+        int dirty = 0;
+        for (int i = 0; i < g_width * g_height * 4; i += 4)
+        {
+            if (g_pBits[i] != 0 || g_pBits[i+1] != 0 || g_pBits[i+2] != 0 || g_pBits[i+3] != 0)
+            {
+                dirty = 1;
+                break;
+            }
+        }
+        printf("paintbrush-overlay: flush() dirty=%d hWnd=%p IsWindow=%d visible=%d\n",
+            dirty, (void*)g_hWnd, IsWindow(g_hWnd), IsWindowVisible(g_hWnd));
+        fflush(stdout);
+    }
 
     /* 推送 DIB 到屏幕 */
     updateScreen();
