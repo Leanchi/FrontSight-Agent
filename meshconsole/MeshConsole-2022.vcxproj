@@ -131,6 +131,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\meshcore\agentcore.h" />
+    <ClInclude Include="..\meshcore\paintbrush_overlay.h" />
     <ClInclude Include="..\meshcore\KVM\Windows\input.h" />
     <ClInclude Include="..\meshcore\KVM\Windows\kvm.h" />
     <ClInclude Include="..\meshcore\KVM\Windows\tile.h" />
