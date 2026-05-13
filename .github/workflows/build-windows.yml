@@ -40,15 +40,17 @@ jobs:
           Get-ChildItem -Recurse -Path Release -Filter *.exe | ForEach-Object {
             Copy-Item $_.FullName -Destination artifacts/
           }
+          # 列出收集到的文件，便于调试
+          Get-ChildItem -Path artifacts
 
       - name: Upload MeshService64
         uses: actions/upload-artifact@v4
         with:
           name: MeshService64
-          path: artifacts/MeshService-2022.exe
+          path: artifacts/MeshService64.exe
 
-      - name: Upload MeshConsole64
+      - name: Upload MeshConsole
         uses: actions/upload-artifact@v4
         with:
-          name: MeshConsole64
-          path: artifacts/MeshConsole-2022.exe
+          name: MeshConsole
+          path: artifacts/MeshConsole.exe
