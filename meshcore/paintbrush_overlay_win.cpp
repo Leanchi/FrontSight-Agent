@@ -18,6 +18,7 @@ Copyright 2026 红点画笔 C 原生模块 (Windows 版本)
 #include <string.h>
 #include "../microscript/duktape.h"
 #include "../microscript/ILibDuktape_Helpers.h"
+#include "paintbrush_overlay.h"
 
 #pragma comment(lib, "gdiplus.lib")
 
@@ -357,7 +358,7 @@ duk_ret_t paintbrush_drawStroke(duk_context *ctx)
 
     for (duk_size_t i = 0; i < len; i++)
     {
-        duk_get_prop_index(ctx, 0, i);
+        duk_get_prop_index(ctx, 0, (duk_uarridx_t)i);
         duk_get_prop_string(ctx, -1, "x");
         pts[i].X = CLAMP(duk_get_int(ctx, -1), g_width);
         duk_pop(ctx);
@@ -367,7 +368,7 @@ duk_ret_t paintbrush_drawStroke(duk_context *ctx)
     }
 
     /* 画多段线 */
-    g_pGraphics->DrawLines(g_pPen, pts, len);
+    g_pGraphics->DrawLines(g_pPen, pts, (INT)len);
 
     /* 端点圆 */
     SolidBrush brush(Color(255, 255, 0, 0));
