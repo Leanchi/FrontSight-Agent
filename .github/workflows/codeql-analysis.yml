@@ -44,6 +44,7 @@ jobs:
     #    uses a compiled language
 
     - run: |
+        sudo apt-get update && sudo apt-get install -y libx11-dev libxext-dev
         make linux ARCHID=6 KVM=0
     #   make bootstrap
     #   make release
