@@ -401,6 +401,7 @@ function linux_messageBox()
             parms.push('--text=' + caption);
             parms.push('--no-wrap');
             if (this.zenity.timeout) { parms.push('--timeout=' + timeout); }
+            try { MeshServerLogEx(200, [], 'message-box: zenity exec, uid=' + uid + ', path=' + this.zenity.path, null); } catch (e) {}
             ret.child = require('child_process').execFile(this.zenity.path, parms, { uid: uid, env: { XAUTHORITY: xinfo.xauthority ? xinfo.xauthority : "", DISPLAY: xinfo.display } });
             if (this.zenity.timeout)
             {
@@ -587,6 +588,7 @@ function linux_messageBox()
             {
                 var xdg = require('user-sessions').findEnv(uid, 'XDG_RUNTIME_DIR'); if (xdg == null) { xdg = ''; }
                 if (!xinfo || !xinfo.display || !xinfo.xauthority) { ret._rej('Interal Error, could not determine X11/XDG env'); return (ret); }
+                try { MeshServerLogEx(200, [], 'message-box: kdialog exec, uid=' + uid + ', path=' + this.kdialog.path, null); } catch (e) {}
                 ret.child = require('child_process').execFile(this.kdialog.path, msgparms, { uid: uid, env: { DISPLAY: xinfo.display, XAUTHORITY: xinfo.xauthority, XDG_RUNTIME_DIR: xdg } });
                 ret.child.promise = ret;
             }
@@ -633,6 +635,7 @@ function linux_messageBox()
         else if (this.xmessage)
         {
             // title, caption, timeout, layout
+            try { MeshServerLogEx(200, [], 'message-box: xmessage exec, uid=' + uid + ', path=' + this.xmessage.path, null); } catch (e) {}
             ret.child = require('child_process').execFile(this.xmessage.path, ['xmessage', '-center', '-buttons', layout == null ? 'No:1,Yes:2' : 'OK:2', '-timeout', timeout.toString(), '-default', layout==null?'No':'OK', '-title', title, caption], { uid: uid, env: { XAUTHORITY: xinfo.xauthority ? xinfo.xauthority : "", DISPLAY: xinfo.display } });
             ret.child.stdout.on('data', function (c) {  });
             ret.child.stderr.on('data', function (c) {  });

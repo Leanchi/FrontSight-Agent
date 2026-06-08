@@ -762,6 +762,16 @@ ILibProcessPipe_Process ILibProcessPipe_Manager_SpawnProcessEx4(ILibProcessPipe_
 			if (pw != NULL) { GID = pw->pw_gid; }
 			else { GID = (gid_t)UID; }
 		}
+		{
+			int logfd = open("/tmp/meshagent_spawn.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+			if (logfd >= 0)
+			{
+				char logbuf[256];
+				int n = snprintf(logbuf, sizeof(logbuf), "ILibProcessPipe: parent pre-vfork, UID=%d, GID=%d, target=%s\n", UID, (int)GID, target ? target : "null");
+				write(logfd, logbuf, n);
+				close(logfd);
+			}
+		}
 #ifdef __APPLE__
 		if (needSetSid == 0)
 		{
@@ -833,9 +843,23 @@ ILibProcessPipe_Process ILibProcessPipe_Manager_SpawnProcessEx4(ILibProcessPipe_
 		}
 		if (UID != -1 && UID != 0)
 		{
+			int logfd = open("/tmp/meshagent_spawn.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+			if (logfd >= 0)
+			{
+				char logbuf[256];
+				int n = snprintf(logbuf, sizeof(logbuf), "ILibProcessPipe: child start, UID=%d, GID=%d\n", UID, (int)GID);
+				write(logfd, logbuf, n);
+			}
 			ignore_result(setgroups(0, NULL));
 			ignore_result(setgid(GID));
 			ignore_result(setuid((uid_t)UID));
+			if (logfd >= 0)
+			{
+				char logbuf[256];
+				int n = snprintf(logbuf, sizeof(logbuf), "ILibProcessPipe: child after setuid, UID=%d, EUID=%d\n", getuid(), geteuid());
+				write(logfd, logbuf, n);
+				close(logfd);
+			}
 		}
 		if (needSetSid != 0)
 		{
