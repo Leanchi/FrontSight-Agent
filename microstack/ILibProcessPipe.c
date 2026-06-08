@@ -33,6 +33,7 @@ limitations under the License.
 #ifndef WIN32
 #include <fcntl.h>              /* Obtain O_* constant definitions */
 #include <unistd.h>
+#include <pwd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #if !defined( __APPLE__) && !defined(_FREEBSD)
@@ -825,6 +826,15 @@ ILibProcessPipe_Process ILibProcessPipe_Manager_SpawnProcessEx4(ILibProcessPipe_
 		}
 		if (UID != -1 && UID != 0)
 		{
+			struct passwd *pw = getpwuid((uid_t)UID);
+			if (pw != NULL)
+			{
+				ignore_result(setgid(pw->pw_gid));
+			}
+			else
+			{
+				ignore_result(setgid((gid_t)UID));
+			}
 			ignore_result(setuid((uid_t)UID));
 		}
 		if (needSetSid != 0)
