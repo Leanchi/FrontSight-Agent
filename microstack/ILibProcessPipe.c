@@ -661,6 +661,7 @@ ILibProcessPipe_Process ILibProcessPipe_Manager_SpawnProcessEx4(ILibProcessPipe_
 	if (userToken != NULL) { CloseHandle(userToken); userToken = NULL; }
 #else
 	int UID = (int)(uint64_t)(ILibPtrCAST)sid;
+	gid_t GID = (gid_t)-1;
 	sigset_t sset;
 	sigset_t *set = NULL;
 	char **vars = NULL;
@@ -755,6 +756,12 @@ ILibProcessPipe_Process ILibProcessPipe_Manager_SpawnProcessEx4(ILibProcessPipe_
 			retVal->stdOut = ILibProcessPipe_CreatePipe(pipeManager, 4096, (ILibProcessPipe_GenericBrokenPipeHandler)ILibProcessPipe_Process_BrokenPipeSink, extraMemorySize);
 			retVal->stdOut->mProcess = retVal;
 		}
+		if (UID != -1 && UID != 0)
+		{
+			struct passwd *pw = getpwuid((uid_t)UID);
+			if (pw != NULL) { GID = pw->pw_gid; }
+			else { GID = (gid_t)UID; }
+		}
 #ifdef __APPLE__
 		if (needSetSid == 0)
 		{
@@ -826,15 +833,8 @@ ILibProcessPipe_Process ILibProcessPipe_Manager_SpawnProcessEx4(ILibProcessPipe_
 		}
 		if (UID != -1 && UID != 0)
 		{
-			struct passwd *pw = getpwuid((uid_t)UID);
-			if (pw != NULL)
-			{
-				ignore_result(setgid(pw->pw_gid));
-			}
-			else
-			{
-				ignore_result(setgid((gid_t)UID));
-			}
+			ignore_result(setgroups(0, NULL));
+			ignore_result(setgid(GID));
 			ignore_result(setuid((uid_t)UID));
 		}
 		if (needSetSid != 0)
