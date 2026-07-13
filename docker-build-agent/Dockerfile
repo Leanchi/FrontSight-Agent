@@ -13,4 +13,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 COPY . /build/
 
-RUN make linux ARCHID=6 CEXTRA="-DBLUR_DEBUG"
+RUN make linux ARCHID=6 CEXTRA="-DBLUR_DEBUG -DSLAVELOG_DEBUG"

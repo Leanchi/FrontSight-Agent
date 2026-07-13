@@ -21,6 +21,27 @@ static FILE *blur_log = NULL;
 #define BLUR_LOG(fmt, ...)
 #endif
 
+/* ============================================================================
+ * X error handler: 防止 X11 默认 error handler 调用 exit() 杀死 slave 进程.
+ *
+ * 根因: get_blurred_regions() 遍历窗口列表时, 如果某个窗口正好被销毁,
+ * XGetWindowAttributes / XTranslateCoordinates 等 X 调用会触发 X error.
+ * X11 默认 error handler 会调用 exit(1), 导致 slave 进程瞬间死亡,
+ * 信号 handler 都来不及执行 (因为 exit 不触发信号).
+ *
+ * 修复: 安装自定义 error handler, 只设置标志位, 不 exit.
+ * get_blurred_regions 在每次关键 X 调用后检查标志位, 出错就提前返回.
+ * ============================================================================ */
+static int g_xerror_occurred = 0;
+
+static int blur_xerror_handler(Display *disp, XErrorEvent *ev)
+{
+    g_xerror_occurred = 1;
+    BLUR_LOG("[BLUR] X error caught! type=%d, serial=%lu, error_code=%d, request_code=%d, minor_code=%d\n",
+             ev->type, ev->serial, ev->error_code, ev->request_code, ev->minor_code);
+    return 0;  /* 返回 0 表示已处理, X11 不会 abort/exit */
+}
+
 /* 裁剪矩形到屏幕范围内 */
 static void clip_rect(BlurRect *r, int screen_w, int screen_h)
 {
@@ -140,6 +161,10 @@ int get_blurred_regions(BlurRect **regions)
     BLUR_LOG("[BLUR] get_blurred_regions called\n");
 #endif
 
+    /* 安装自定义 X error handler, 防止 X error 触发默认 exit() */
+    g_xerror_occurred = 0;
+    XSetErrorHandler(blur_xerror_handler);
+
     Display *disp = XOpenDisplay(NULL);
     if (!disp) {
         BLUR_LOG("[BLUR] XOpenDisplay(NULL) failed, DISPLAY=%s\n", getenv("DISPLAY") ? getenv("DISPLAY") : "(null)");
@@ -204,8 +229,26 @@ int get_blurred_regions(BlurRect **regions)
         return 0;
     }
 
+    /* 拷贝窗口 ID 到本地数组, 因为 prop 之后会被释放
+     * 防止窗口在遍历过程中被销毁导致访问悬空指针 */
+    Window *win_ids = (Window *)malloc(count * sizeof(Window));
+    if (!win_ids) {
+        free(win_info);
+        XFree(prop);
+        XCloseDisplay(disp);
+        return 0;
+    }
+    memcpy(win_ids, windows, count * sizeof(Window));
+    XFree(prop);  /* 提前释放, 已拷贝到 win_ids */
+    windows = win_ids;
+
     for (int i = 0; i < count; i++) {
+        if (g_xerror_occurred) {
+            BLUR_LOG("[BLUR] X error during window info collection at index %d, aborting\n", i);
+            break;
+        }
         XWindowAttributes attr;
+        /* XSync 强制 flush 并等待 error handler 执行, 这样能捕获到 BadWindow 等错误 */
         if (XGetWindowAttributes(disp, windows[i], &attr)) {
             int root_x = 0, root_y = 0;
             Window child;
@@ -220,21 +263,30 @@ int get_blurred_regions(BlurRect **regions)
             win_info[i].is_opaque = 1; /* 默认不透明 */
         }
     }
+    XSync(disp, False);  /* flush 所有 pending error, 确保 handler 被调用 */
+    if (g_xerror_occurred) {
+        BLUR_LOG("[BLUR] X error detected after window attributes collection, skipping blur this frame\n");
+        free(win_info);
+        free(win_ids);
+        XCloseDisplay(disp);
+        return 0;
+    }
 
     /* 收集匹配窗口的索引 */
     int *match_indices = (int *)malloc(count * sizeof(int));
     BlurRect *match_bounds = (BlurRect *)malloc(count * sizeof(BlurRect));
     if (!match_indices || !match_bounds) {
         free(win_info);
+        free(win_ids);
         free(match_indices);
         free(match_bounds);
-        XFree(prop);
         XCloseDisplay(disp);
         return 0;
     }
     int match_count = 0;
 
     for (int i = 0; i < count; i++) {
+        if (g_xerror_occurred) break;
         if (!win_info[i].is_visible) continue;
         if (win_info[i].w < 50 || win_info[i].h < 50) continue;
 
@@ -250,8 +302,16 @@ int get_blurred_regions(BlurRect **regions)
         }
         free(title);
     }
-
-    XFree(prop);
+    XSync(disp, False);
+    if (g_xerror_occurred) {
+        BLUR_LOG("[BLUR] X error during title collection, aborting\n");
+        free(win_info);
+        free(win_ids);
+        free(match_indices);
+        free(match_bounds);
+        XCloseDisplay(disp);
+        return 0;
+    }
 
     BLUR_LOG("[BLUR] Matched %d windows\n", match_count);
 
@@ -340,9 +400,13 @@ int get_blurred_regions(BlurRect **regions)
     }
 
     free(win_info);
+    free(win_ids);
     free(match_indices);
     free(match_bounds);
     XCloseDisplay(disp);
+
+    /* 恢复默认 X error handler, 避免影响主循环的其他 X 调用 */
+    XSetErrorHandler(NULL);
 
     BLUR_LOG("[BLUR] Final: %d blur regions computed\n", blur_count);
 

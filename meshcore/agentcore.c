@@ -4314,7 +4314,12 @@ void MeshServer_Connect(MeshAgentHostContainer *agent)
 	agent->consoleText_maxRate = ILibSimpleDataStore_GetInt(agent->masterDb, "consoleTextMaxRate", 10);
 
 #if defined(_LINKVM) && defined(_POSIX) && !defined(__APPLE__)
-	SLAVELOG = ILibSimpleDataStore_Get(agent->masterDb, "slaveKvmLog", NULL, 0);
+	#ifdef SLAVELOG_DEBUG
+		// debug 构建: 强制开启 slave 日志, 忽略 .msh 配置
+		SLAVELOG = 1;
+	#else
+		SLAVELOG = ILibSimpleDataStore_Get(agent->masterDb, "slaveKvmLog", NULL, 0);
+	#endif
 #endif
 
 	if (agent->logUpdate != 0) { ILIBLOGMESSAGEX("PLATFORM_TYPE: %d", agent->platformType); }

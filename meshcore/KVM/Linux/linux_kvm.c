@@ -30,6 +30,9 @@ limitations under the License.
 #include <X11/keysym.h>
 #include <X11/Xlib.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
 
 #if !defined(_FREEBSD)
 	#include <sys/prctl.h>
@@ -104,7 +107,13 @@ typedef struct _XkbStateNotifyEvent
 } XkbStateNotifyEvent;
 
 int curcursor = KVM_MouseCursor_HELP;
+// SLAVELOG_DEBUG: 编译时强制开启 slave 日志, 不依赖 .msh 的 slaveKvmLog 配置.
+// 正式版不定义此宏; 仅 debug 构建用 CEXTRA=-DSLAVELOG_DEBUG 启用.
+#ifdef SLAVELOG_DEBUG
+int SLAVELOG = 1;
+#else
 int SLAVELOG = 0;
+#endif
 
 int SCREEN_NUM = 0;
 int SCREEN_WIDTH = 0;
@@ -507,6 +516,7 @@ int kvm_init(int displayNo)
 	{
 		x11ext_exports = ILibMemory_SmartAllocate(sizeof(x11ext_struct));
 		x11ext_exports->xext_lib = dlopen(Location_X11EXT, RTLD_NOW);
+		if (logFile) { fprintf(logFile, "dlopen(%s) = %p%s\n", Location_X11EXT, x11ext_exports->xext_lib, x11ext_exports->xext_lib ? "" : dlerror()); fflush(logFile); }
 		if (x11ext_exports->xext_lib)
 		{
 			((void**)x11ext_exports)[1] = (void*)dlsym(x11ext_exports->xext_lib, "XShmDetach");
@@ -519,6 +529,7 @@ int kvm_init(int displayNo)
 	{
 		x11tst_exports = ILibMemory_SmartAllocate(sizeof(x11tst_struct));
 		x11tst_exports->x11tst_lib = dlopen(Location_X11TST, RTLD_NOW);
+		if (logFile) { fprintf(logFile, "dlopen(%s) = %p%s\n", Location_X11TST, x11tst_exports->x11tst_lib, x11tst_exports->x11tst_lib ? "" : dlerror()); fflush(logFile); }
 		if (x11tst_exports->x11tst_lib)
 		{
 			((void**)x11tst_exports)[1] = (void*)dlsym(x11tst_exports->x11tst_lib, "XTestFakeMotionEvent");
@@ -530,6 +541,7 @@ int kvm_init(int displayNo)
 	{
 		x11_exports = ILibMemory_SmartAllocate(sizeof(x11_struct));
 		x11_exports->x11_lib = dlopen(Location_X11LIB, RTLD_NOW);
+		if (logFile) { fprintf(logFile, "dlopen(%s) = %p%s\n", Location_X11LIB, x11_exports->x11_lib, x11_exports->x11_lib ? "" : dlerror()); fflush(logFile); }
 		if (x11_exports->x11_lib)
 		{
 			((void**)x11_exports)[1] = (void*)dlsym(x11_exports->x11_lib, "XOpenDisplay");
@@ -563,6 +575,7 @@ int kvm_init(int displayNo)
 	{
 		xfixes_exports = ILibMemory_SmartAllocate(sizeof(xfixes_struct));
 		xfixes_exports->xfixes_lib = dlopen(Location_X11FIXES, RTLD_NOW);
+		if (logFile) { fprintf(logFile, "dlopen(%s) = %p%s\n", Location_X11FIXES, xfixes_exports->xfixes_lib, xfixes_exports->xfixes_lib ? "" : dlerror()); fflush(logFile); }
 		if (xfixes_exports->xfixes_lib)
 		{
 			((void**)xfixes_exports)[1] = (void*)dlsym(xfixes_exports->xfixes_lib, "XFixesSelectCursorInput");
@@ -575,6 +588,7 @@ int kvm_init(int displayNo)
 	{
 		xkb_exports = ILibMemory_SmartAllocate(sizeof(xkb_struct));
 		xkb_exports->xkb_lib = dlopen(Location_X11KB, RTLD_NOW);
+		if (logFile) { fprintf(logFile, "dlopen(%s) = %p%s\n", Location_X11KB, xkb_exports->xkb_lib, xkb_exports->xkb_lib ? "" : dlerror()); fflush(logFile); }
 		if (xkb_exports->xkb_lib)
 		{
 			((void**)xkb_exports)[1] = (void*)dlsym(xkb_exports->xkb_lib, "XkbGetState");
@@ -587,15 +601,27 @@ int kvm_init(int displayNo)
 
 	sprintf_s(CURRENT_XDISPLAY, sizeof(CURRENT_XDISPLAY), ":%d", (int)displayNo);
 
+	if (logFile) { fprintf(logFile, "Before XOpenDisplay(%s): uid=%d, XAUTHORITY=%s, DISPLAY=%s\n", CURRENT_XDISPLAY, getuid(), getenv("XAUTHORITY")==NULL?"(null)":getenv("XAUTHORITY"), getenv("DISPLAY")==NULL?"(null)":getenv("DISPLAY")); fflush(logFile); }
 	eventdisplay = x11_exports->XOpenDisplay(CURRENT_XDISPLAY);
+	if (logFile) { fprintf(logFile, "XOpenDisplay returned %p\n", eventdisplay); fflush(logFile); }
 	if (logFile) { fprintf(logFile, "XAUTHORITY is %s\n", getenv("XAUTHORITY")); fflush(logFile); }
 	if (logFile) { fprintf(logFile, "DisplayString is %s\n", CURRENT_XDISPLAY); fflush(logFile); }
 
 	if (eventdisplay == NULL)
 	{
 		char tmpBuff[1024];
+		// 诊断: X socket 是否存在、权限、errno — XOpenDisplay 失败时这三者最能区分原因
+		if (logFile)
+		{
+			char sockpath[64];
+			sprintf_s(sockpath, sizeof(sockpath), "/tmp/.X11-unix/X%d", displayNo);
+			struct stat st;
+			int sr = stat(sockpath, &st);
+			fprintf(logFile, "XOpenDisplay FAILED. errno=%d (%s). X socket '%s': stat=%d%s, access(F_OK)=%d, access(R_OK)=%d, access(W_OK)=%d\n",
+				errno, strerror(errno), sockpath, sr, sr==0?" (exists)":" (missing)", access(sockpath, F_OK), access(sockpath, R_OK), access(sockpath, W_OK));
+			fflush(logFile);
+		}
 		sprintf_s(tmpBuff, sizeof(tmpBuff), "XOpenDisplay(%s) failed, using XAUTHORITY: %s", CURRENT_XDISPLAY, getenv("XAUTHORITY"));
-		if (logFile) { fprintf(logFile, "XOpenDisplay(%s) failed, using XAUTHORITY: %s\n", CURRENT_XDISPLAY, getenv("XAUTHORITY")); fflush(logFile); }
 		kvm_send_error(tmpBuff);
 		return(-1);
 	}
@@ -956,6 +982,22 @@ void bitblt(char *sourcebitmap, int source_width, int source_height, int sx, int
 
 void kvm_server_sighandler(int signum, siginfo_t *info, void *context)
 {
+	if (logFile)
+	{
+		const char *signame = "UNKNOWN";
+		switch (signum) {
+			case SIGTERM: signame = "SIGTERM"; break;
+			case SIGSEGV: signame = "SIGSEGV"; break;
+			case SIGABRT: signame = "SIGABRT"; break;
+			case SIGBUS:  signame = "SIGBUS"; break;
+			case SIGFPE:  signame = "SIGFPE"; break;
+			case SIGILL:  signame = "SIGILL"; break;
+			case SIGKILL: signame = "SIGKILL"; break;
+			case SIGPIPE: signame = "SIGPIPE"; break;
+		}
+		fprintf(logFile, "SLAVE caught signal %d (%s) at address %p. Setting g_shutdown=1.\n", signum, signame, info ? info->si_addr : NULL);
+		fflush(logFile);
+	}
 	g_shutdown = 1;
 }
 void* kvm_server_mainloop(void* parm)
@@ -1020,6 +1062,13 @@ void* kvm_server_mainloop(void* parm)
 	sigemptyset(&action.sa_mask);
 	action.sa_flags = SA_SIGINFO;
 	ignore_result(sigaction(SIGTERM, &action, NULL));
+	// 捕获崩溃信号, 这样 slave 崩溃时能在 /tmp/slave 留下死因
+	ignore_result(sigaction(SIGSEGV, &action, NULL));
+	ignore_result(sigaction(SIGABRT, &action, NULL));
+	ignore_result(sigaction(SIGBUS, &action, NULL));
+	ignore_result(sigaction(SIGFPE, &action, NULL));
+	ignore_result(sigaction(SIGILL, &action, NULL));
+	ignore_result(sigaction(SIGPIPE, &action, NULL));
 
 	//pthread_create(&kvmthread, NULL, kvm_mainloopinput, parm);
 	//fprintf(logFile, "Created the kvmthread.\n"); fflush(logFile);
@@ -1492,8 +1541,28 @@ void* kvm_relay_restart(int paused, void *processPipeMgr, ILibKVM_WriteHandler w
 		close(slave2master[0]);
 		close(master2slave[1]);
 
-		if (SLAVELOG != 0) { logFile = fopen("/tmp/slave", "w"); }
-		if (uid != 0) { ignore_result(setuid(uid)); }
+		if (SLAVELOG != 0)
+		{
+			// 用 0666 权限创建, 这样即使 setuid 切换到桌面用户后仍可写日志.
+			// (fopen 用 0666 & ~umask, root 的 umask 通常是 022 -> 实际 644, 其他用户写不了)
+			int slaveFd = open("/tmp/slave", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+			if (slaveFd >= 0) { logFile = fdopen(slaveFd, "w"); }
+		}
+		// 诊断: setuid 前后的真实 uid, 以及 setuid 是否成功.
+		// ignore_result 会丢弃返回值, 出问题时完全无线索.
+		{
+			uid_t ruid_before = getuid();
+			if (logFile) { fprintf(logFile, "SLAVE fork: requested uid=%d, real uid before setuid=%d\n", uid, ruid_before); fflush(logFile); }
+			if (uid != 0)
+			{
+				int su_ret = setuid(uid);
+				if (logFile) { fprintf(logFile, "SLAVE setuid(%d) returned %d, errno=%d (%s), real uid now=%d\n", uid, su_ret, errno, strerror(errno), getuid()); fflush(logFile); }
+			}
+			else
+			{
+				if (logFile) { fprintf(logFile, "SLAVE uid=0, NOT calling setuid (staying root)\n"); fflush(logFile); }
+			}
+		}
 
 		if (g_ILibCrashDump_path != NULL)
 		{
@@ -1509,8 +1578,10 @@ void* kvm_relay_restart(int paused, void *processPipeMgr, ILibKVM_WriteHandler w
 
 
 		//fprintf(logFile, "Starting kvm_server_mainloop\n");
+		if (logFile) { fprintf(logFile, "SLAVE authToken=%s, dispid=%s\n", authToken==NULL?"(null)":authToken, dispid==NULL?"(null)":dispid); fflush(logFile); }
 		if (authToken != NULL) { setenv("XAUTHORITY", authToken, 1); }
 		if (dispid != NULL) { setenv("DISPLAY", dispid, 1); }
+		if (logFile) { fprintf(logFile, "SLAVE after setenv: XAUTHORITY=%s, DISPLAY=%s\n", getenv("XAUTHORITY")==NULL?"(null)":getenv("XAUTHORITY"), getenv("DISPLAY")==NULL?"(null)":getenv("DISPLAY")); fflush(logFile); }
 
 		kvm_server_mainloop((void*)0);
 		exit(0);
