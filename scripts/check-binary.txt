@@ -1,0 +1,133 @@
+#!/bin/bash
+# ---- CRLF 自愈 ----
+if grep -q $'\r' "$0" 2>/dev/null; then
+  tmpf=$(mktemp 2>/dev/null) || tmpf="/tmp/.cb.$$.clean"
+  tr -d '\r' < "$0" > "$tmpf" && cat "$tmpf" > "$0" && rm -f "$tmpf"
+  exec "$0" "$@"
+fi
+
+# =============================================================================
+# 二进制可用性检查 (不依赖 MD5)
+#
+# 目的: 不管文件怎么传输的, 直接检查它是不是能用的 debug agent.
+#
+# 用法: ./check-binary.sh [文件路径]
+# =============================================================================
+
+set -u
+LOG="/tmp/check-binary-$(date +%Y%m%d-%H%M%S).log"
+exec > >(tee -a "$LOG") 2>&1
+
+RED=$'\033[1;31m'; GRN=$'\033[1;32m'; YEL=$'\033[1;33m'; CYN=$'\033[1;36m'; DIM=$'\033[2m'; RST=$'\033[0m'
+ok()   { echo "${GRN}[ OK ]${RST} $*"; }
+fail() { echo "${RED}[FAIL]${RST} $*"; }
+warn() { echo "${YEL}[WARN]${RST} $*"; }
+hdr()  { echo; echo "${CYN}========== $* ==========${RST}"; }
+
+echo "二进制可用性检查"
+echo "时间: $(date)"
+
+TARGET="${1:-}"
+if [ -z "$TARGET" ]; then
+    echo "用法: $0 <文件路径>"
+    echo "扫描常见位置..."
+    for cand in ./meshagent_x86-64_debug ./meshagent_x86-64_debug.txt \
+                ./meshagent_x86-64 ./meshagent-x86-64-debug.deploy.txt \
+                /tmp/meshagent_x86-64_debug; do
+        if [ -e "$cand" ]; then TARGET="$cand"; echo "找到: $TARGET"; break; fi
+    done
+    [ -z "$TARGET" ] && { fail "没找到文件"; exit 1; }
+fi
+
+[ ! -e "$TARGET" ] && { fail "文件不存在: $TARGET"; exit 1; }
+
+hdr "1. 文件基本信息"
+ls -la "$TARGET"
+echo "file: $(file "$TARGET" 2>/dev/null | cut -d: -f2-)"
+SIZE=$(stat -c '%s' "$TARGET" 2>/dev/null || stat -f '%z' "$TARGET" 2>/dev/null)
+echo "大小: $SIZE 字节"
+
+hdr "2. ELF 魔数检查 (最关键)"
+# 读前 4 字节, 应该是 7f 45 4c 46 (.ELF)
+MAGIC=$(head -c 4 "$TARGET" 2>/dev/null | od -A n -t x1 | tr -d ' \n')
+echo "前4字节: $MAGIC"
+if [ "$MAGIC" = "7f454c46" ]; then
+    ok "✓ 是有效的 ELF 文件"
+else
+    fail "✗ 不是 ELF! 魔数是 $MAGIC (应为 7f454c46)"
+    echo
+    echo "${DIM}-- 看看文件开头到底是什么 (前 64 字节) --${RST}"
+    head -c 64 "$TARGET" 2>/dev/null | od -A x -t x1z | head -4
+    echo
+    echo "${DIM}-- 如果开头是文本, 看看前几行 --${RST}"
+    head -c 200 "$TARGET" 2>/dev/null | strings | head -3
+    echo
+    echo "${CYN}如果不是 ELF, 可能需要先解码/解压. 看上面输出判断格式.${RST}"
+    exit 1
+fi
+
+hdr "3. ELF 头完整性"
+# ELF header 的 e_machine 字段 (偏移 0x12, 2字节) 应该是 0x3e (x86-64)
+MACHINE=$(head -c 20 "$TARGET" 2>/dev/null | tail -c 2 | od -A n -t x1 | tr -d ' \n')
+echo "e_machine: $MACHINE (0x3e00 = x86-64)"
+if echo "$MACHINE" | grep -q "3e00"; then
+    ok "✓ 是 x86-64 架构"
+else
+    warn "e_machine = $MACHINE, 不是标准 x86-64 字节序 (可能正常, 看字节序)"
+fi
+
+hdr "4. 诊断字符串检查 (判断是不是 debug 版)"
+echo "debug 版应该包含这些字符串:"
+echo
+DEBUG_COUNT=0
+for pattern in "SLAVE fork: requested uid" "SLAVE setuid" "Before XOpenDisplay" "XOpenDisplay returned" "SLAVE after setenv" "dlopen" "XOpenDisplay FAILED"; do
+    if strings "$TARGET" 2>/dev/null | grep -qF "$pattern"; then
+        ok "  ✓ $pattern"
+        DEBUG_COUNT=$((DEBUG_COUNT + 1))
+    else
+        fail "  ✗ $pattern"
+    fi
+done
+echo
+echo "命中: $DEBUG_COUNT / 7"
+
+hdr "5. 可执行权限"
+if [ -x "$TARGET" ]; then
+    ok "✓ 有可执行权限"
+else
+    warn "无可执行权限, 执行: chmod +x \"$TARGET\""
+fi
+
+hdr "6. 试运行 (--help 或直接执行看错误)"
+echo "${DIM}-- 尝试执行, 看报什么错 --${RST}"
+# agent 二进制执行时会尝试连接服务器, 所以只看前几行输出就 kill
+timeout 2 "$TARGET" --help 2>&1 | head -5 || true
+timeout 2 "$TARGET" 2>&1 | head -5 || true
+echo "(如果上面有 'cannot execute' / 'format error' 说明文件损坏)"
+echo "(如果输出 agent 启动信息, 说明二进制可用)"
+
+# =============================================================================
+hdr "判定"
+echo
+if [ "$DEBUG_COUNT" -ge 5 ]; then
+    echo "${GRN}>>> 这是可用的 debug 版!${RST}"
+    echo "    不管 MD5 对不对, 这个二进制能用."
+    echo "    直接替换部署, 然后查 /tmp/slave:"
+    echo
+    echo "    sudo systemctl stop meshagent"
+    echo "    sudo cp \"$TARGET\" /opt/meshagent/meshagent_x86-64"
+    echo "    sudo chmod +x /opt/meshagent/meshagent_x86-64"
+    echo "    sudo rm -f /tmp/slave"
+    echo "    sudo systemctl start meshagent"
+    echo "    # web 触发连接后: cat /tmp/slave"
+elif [ "$DEBUG_COUNT" -gt 0 ]; then
+    echo "${YEL}>>> 部分诊断字符串存在, 可能是旧版 debug 或部分编译${RST}"
+else
+    echo "${RED}>>> 这不是 debug 版${RST}"
+    echo "    可能是原始 agent 或损坏的文件."
+    echo "    如果 ELF 魔数对 (第2步通过), 这个二进制也许能跑,"
+    echo "    但不会有诊断日志. 检查 strings 输出确认是哪个版本."
+fi
+
+echo
+echo "${DIM}日志: $LOG${RST}"

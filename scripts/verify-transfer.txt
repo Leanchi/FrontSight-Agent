@@ -1,0 +1,156 @@
+#!/bin/bash
+# ---- CRLF 自愈 (这个脚本本身可能被 Windows 转码) ----
+if grep -q $'\r' "$0" 2>/dev/null; then
+  tmpf=$(mktemp 2>/dev/null) || tmpf="/tmp/.vt.$$.clean"
+  tr -d '\r' < "$0" > "$tmpf" && cat "$tmpf" > "$0" && rm -f "$tmpf"
+  exec "$0" "$@"
+fi
+
+# =============================================================================
+# 传输完整性验证: 检查 UOS 上的文件是不是 mac 上的原始文件
+#
+# 用法:
+#   ./verify-transfer.sh <文件路径>
+#   或不传参数, 自动扫描常见位置
+# =============================================================================
+
+set -u
+LOG="/tmp/verify-transfer-$(date +%Y%m%d-%H%M%S).log"
+exec > >(tee -a "$LOG") 2>&1
+
+RED=$'\033[1;31m'; GRN=$'\033[1;32m'; YEL=$'\033[1;33m'; CYN=$'\033[1;36m'; DIM=$'\033[2m'; RST=$'\033[0m'
+ok()   { echo "${GRN}[ OK ]${RST} $*"; }
+fail() { echo "${RED}[FAIL]${RST} $*"; }
+warn() { echo "${YEL}[WARN]${RST} $*"; }
+hdr()  { echo; echo "${CYN}========== $* ==========${RST}"; }
+
+echo "传输完整性验证"
+echo "时间: $(date)"
+
+# mac 上的源文件指纹 (基准)
+ELF_MD5="80c9d4dece059c228e6d4b92f5881ef2"
+ELF_SIZE=3773840
+DEPLOY_MD5="a528336753a65ba5661f4ed8a3f6f262"
+DEPLOY_SIZE=5098788
+
+# 要验证的文件
+TARGET="${1:-}"
+if [ -z "$TARGET" ]; then
+    hdr "未指定文件, 扫描常见位置"
+    # 扫描当前目录和常见下载位置
+    for cand in \
+        "./meshagent_x86-64_debug" \
+        "./meshagent_x86-64_debug.txt" \
+        "./meshagent-x86-64-debug.deploy.txt" \
+        "./meshagent_x86-64" \
+        "/tmp/meshagent_x86-64_debug" \
+        "/tmp/meshagent-x86-64-debug.deploy.txt" \
+        "$HOME/Downloads/meshagent_x86-64_debug" \
+        "$HOME/Downloads/meshagent-x86-64-debug.deploy.txt"; do
+        if [ -e "$cand" ]; then
+            echo "发现: $cand"
+            TARGET="$cand"
+            break
+        fi
+    done
+    if [ -z "$TARGET" ]; then
+        fail "没找到任何 meshagent 相关文件"
+        echo "请指定路径: ./verify-transfer.sh /path/to/file"
+        exit 1
+    fi
+fi
+
+hdr "验证文件: $TARGET"
+
+if [ ! -e "$TARGET" ]; then
+    fail "文件不存在: $TARGET"
+    exit 1
+fi
+
+echo "${DIM}-- 基本信息 --${RST}"
+ls -la "$TARGET"
+echo "类型: $(file "$TARGET" 2>/dev/null | cut -d: -f2-)"
+echo
+
+echo "${DIM}-- 大小和 MD5 --${RST}"
+ACTUAL_SIZE=$(stat -c '%s' "$TARGET" 2>/dev/null || stat -f '%z' "$TARGET" 2>/dev/null)
+ACTUAL_MD5=$(md5sum "$TARGET" 2>/dev/null | awk '{print $1}')
+[ -z "$ACTUAL_MD5" ] && ACTUAL_MD5=$(md5 "$TARGET" 2>/dev/null | awk -F'= ' '{print $2}')
+echo "实际大小: $ACTUAL_SIZE"
+echo "实际 MD5:  $ACTUAL_MD5"
+echo
+
+# 对比基准
+hdr "对比基准"
+
+# 检查是不是原始 ELF
+if [ "$ACTUAL_MD5" = "$ELF_MD5" ]; then
+    ok "✓ 完全匹配原始 ELF 二进制!"
+    ok "  大小 $ACTUAL_SIZE = $ELF_SIZE, MD5 一致"
+    ok "  -> 传输无损, 可以直接用这个二进制"
+    echo
+    echo "${GRN}结论: 你的链路传输正常, ELF 没有被 Windows 损坏${RST}"
+    echo "${GRN}      可以直接部署这个二进制${RST}"
+    exit 0
+fi
+
+# 检查是不是 deploy.txt
+if [ "$ACTUAL_MD5" = "$DEPLOY_MD5" ]; then
+    ok "✓ 完全匹配 deploy.txt!"
+    ok "  大小 $ACTUAL_SIZE = $DEPLOY_SIZE, MD5 一致"
+    ok "  -> 传输无损, 解码后即得 ELF"
+    echo
+    echo "${CYN}下一步: 解码 deploy.txt${RST}"
+    echo "  awk '/9zXk2Qv7mP_payload_start_nO8wY3/{f=1;next}f' \"$TARGET\" | tr -d '\\r' | base64 -d > meshagent_x86-64_debug"
+    echo "  chmod +x meshagent_x86-64_debug"
+    echo "  md5sum meshagent_x86-64_debug  # 应为 $ELF_MD5"
+    exit 0
+fi
+
+# 都不匹配
+fail "✗ 与两个基准都不匹配!"
+echo
+echo "${DIM}-- 基准对照 --${RST}"
+echo "  原始 ELF:  大小=$ELF_SIZE   MD5=$ELF_MD5"
+echo "  deploy.txt: 大小=$DEPLOY_SIZE  MD5=$DEPLOY_MD5"
+echo "  实际文件:  大小=$ACTUAL_SIZE  MD5=$ACTUAL_MD5"
+echo
+
+# 分析差异
+# 确保 ACTUAL_SIZE 是纯数字, 否则跳过比较
+ACTUAL_SIZE_NUM=$(echo "$ACTUAL_SIZE" | tr -cd '0-9')
+if [ -n "$ACTUAL_SIZE_NUM" ] && [ "$ACTUAL_SIZE_NUM" -gt "$ELF_SIZE" ] 2>/dev/null; then
+    DIFF=$((ACTUAL_SIZE_NUM - ELF_SIZE))
+    warn "实际文件比原始 ELF 大 $DIFF 字节"
+    if [ "$DIFF" -gt 1000 ]; then
+        warn "  -> 几乎确定被 Windows CRLF 转码了 (每个 \\n 变 \\r\\n, 多出 \\r)"
+        warn "  -> ELF 已损坏, 不能用. 必须用 deploy.txt 方案"
+    fi
+elif [ -n "$ACTUAL_SIZE_NUM" ] && [ "$ACTUAL_SIZE_NUM" -lt "$ELF_SIZE" ] 2>/dev/null; then
+    DIFF=$((ELF_SIZE - ACTUAL_SIZE_NUM))
+    warn "实际文件比原始 ELF 小 $DIFF 字节"
+    warn "  -> 传输中丢失了数据, 可能下载不完整"
+fi
+
+# CRLF 检测
+echo
+echo "${DIM}-- CRLF 污染检测 --${RST}"
+# 注意: 用 grep -c 后必须清理换行, 否则 [ ] 比较会因非整数报错
+CRLF_COUNT=$(od -A n -t x1 "$TARGET" 2>/dev/null | tr ' ' '\n' | grep -c '0d0a' 2>/dev/null)
+CRLF_COUNT=$(echo "$CRLF_COUNT" | tr -cd '0-9')
+[ -z "$CRLF_COUNT" ] && CRLF_COUNT=0
+echo "  0d0a 字节序列出现次数: $CRLF_COUNT"
+if [ "$CRLF_COUNT" -gt 5000 ]; then
+    fail "  -> 严重 CRLF 污染! 文件被 Windows 文本模式转码了"
+    fail "  -> ELF 已损坏, 必须用 deploy.txt (base64) 方案重新传输"
+elif [ "$CRLF_COUNT" -gt 100 ]; then
+    warn "  -> 轻度 CRLF 痕迹 (可能是正常的, ELF 里本来就有 0d0a)"
+fi
+
+echo
+echo "${RED}结论: 传输损坏了文件${RST}"
+echo "${RED}      改用 deploy.txt 方案:${RST}"
+echo "${RED}      meshagent-x86-64-debug.deploy.txt 是纯文本, 抗 CRLF${RST}"
+
+echo
+echo "${DIM}日志: $LOG${RST}"

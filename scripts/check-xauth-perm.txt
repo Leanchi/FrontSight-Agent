@@ -1,0 +1,163 @@
+#!/bin/bash
+# ---- CRLF 自愈 ----
+if grep -q $'\r' "$0" 2>/dev/null; then
+  tmpf=$(mktemp 2>/dev/null) || tmpf="/tmp/.chk.$$.clean"
+  tr -d '\r' < "$0" > "$tmpf" && cat "$tmpf" > "$0" && rm -f "$tmpf"
+  exec "$0" "$@"
+fi
+
+# =============================================================================
+# .Xauthority 权限验证 (UOS / 非特权)
+#
+# 目的: 验证 root agent 能否读到 /home/goushan/.Xauthority
+#       这是判断 "X 授权缺失" 真实成因的最后一块拼图.
+#
+# 三个判定:
+#   1. 文件属主是不是 goushan 自己? (deepin 有时会弄成 root)
+#   2. 有没有 immutable 属性 / ACL 拦截? (UOS 安全加固常用)
+#   3. 文件内容是不是空的? (空 cookie 等于没授权)
+# =============================================================================
+
+set -u
+LOG="/tmp/xauth-perm-$(date +%Y%m%d-%H%M%S).log"
+exec > >(tee -a "$LOG") 2>&1
+
+RED=$'\033[1;31m'; GRN=$'\033[1;32m'; YEL=$'\033[1;33m'; CYN=$'\033[1;36m'; DIM=$'\033[2m'; RST=$'\033[0m'
+ok()   { echo "${GRN}[ OK ]${RST} $*"; }
+fail() { echo "${RED}[FAIL]${RST} $*"; }
+warn() { echo "${YEL}[WARN]${RST} $*"; }
+hdr()  { echo; echo "${CYN}========== $* ==========${RST}"; }
+
+echo ".Xauthority 权限验证"
+echo "时间: $(date)   用户: $(id 2>/dev/null)"
+echo "日志: $LOG"
+
+# --- 找到 .Xauthority ---
+XAUTH=""
+for cand in "$HOME/.Xauthority" /home/*/.Xauthority; do
+    if [ -e "$cand" ]; then
+        XAUTH="$cand"
+        break
+    fi
+done 2>/dev/null
+
+hdr "1. 文件基本信息"
+if [ -z "$XAUTH" ]; then
+    fail "找不到任何 .Xauthority 文件"
+    fail "  -> getXInfo 全部 fallback 失败, slave 必崩"
+    exit 1
+fi
+
+echo "路径: $XAUTH"
+echo "${DIM}-- ls -la --${RST}"
+ls -la "$XAUTH" 2>&1 || fail "无权 stat"
+
+echo "${DIM}-- stat (属主/权限/大小) --${RST}"
+stat "$XAUTH" 2>&1 || echo "  (stat 失败)"
+
+hdr "2. 属主判定 (最关键)"
+# 用 ls -l 解析属主和权限, 不需要 root
+PERM_LINE=$(ls -ld "$XAUTH" 2>/dev/null)
+echo "$PERM_LINE"
+if [ -n "$PERM_LINE" ]; then
+    # 解析权限位和属主 (ls -l 输出: drwxr-xr-x N owner group ...)
+    PERM=$(echo "$PERM_LINE" | awk '{print $1}')
+    OWNER=$(echo "$PERM_LINE" | awk '{print $3}')
+    GROUP=$(echo "$PERM_LINE" | awk '{print $4}')
+    echo "权限: $PERM   属主: $OWNER   组: $GROUP"
+    echo
+    CURRENT_USER=$(whoami 2>/dev/null || id -un 2>/dev/null)
+    echo "当前用户: $CURRENT_USER"
+
+    if [ "$OWNER" = "root" ]; then
+        fail "属主是 root, 不是桌面用户!"
+        fail "  -> 如果 slave setuid 到桌面用户后读这个文件, 会被拒"
+        fail "  -> deepin 某些版本/lightdm 会把 .Xauthority 弄成 root 属主"
+    elif [ "$OWNER" = "$CURRENT_USER" ]; then
+        ok "属主 = 当前用户 ($OWNER), 文件可读"
+    else
+        warn "属主是 $OWNER, 不是当前用户 $CURRENT_USER"
+        warn "  -> agent (root) 仍可读 (root 绕过 DAC)"
+        warn "  -> 但若 slave setuid 到 $OWNER 之后, 权限位是 600 才能读"
+    fi
+
+    # 权限位解析 (第 2-4 字符 owner, 5-7 group, 8-10 other)
+    case "$PERM" in
+        ?rwx------*) echo "权限 700 (仅属主可读写)  ->  setuid 到属主后可读" ;;
+        ?rw-------*) echo "权限 600 (仅属主可读写)  ->  setuid 到属主后可读" ;;
+        ?rw-r--r--*|?rwxr-xr-x*) ok "权限含 other-read  ->  任何用户都能读" ;;
+        ?-w*|?---*) fail "权限异常, 属主都不可读" ;;
+    esac
+fi
+
+hdr "3. immutable / ACL / xattr 检查 (UOS 安全加固常用)"
+echo "${DIM}-- lsattr (immutable / 扩展属性) --${RST}"
+if command -v lsattr >/dev/null 2>&1; then
+    lsattr "$XAUTH" 2>&1 || warn "lsattr 失败 (可能文件系统不支持)"
+    if lsattr "$XAUTH" 2>/dev/null | grep -q 'i'; then
+        fail "文件被设了 immutable (i) 属性!  ->  即使 root 也写不了, agent 无法更新"
+    fi
+else
+    warn "无 lsattr 命令, 跳过"
+fi
+
+echo "${DIM}-- getfacl (POSIX ACL) --${RST}"
+if command -v getfacl >/dev/null 2>&1; then
+    getfacl "$XAUTH" 2>&1 || warn "getfacl 失败"
+    # 看有没有 mask: 之外的额外限制
+    if getfacl "$XAUTH" 2>/dev/null | grep -qiE 'user:.*:---|group:.*:---'; then
+        warn "ACL 里有拒绝条目, 可能有额外限制"
+    fi
+else
+    warn "无 getfacl 命令, 跳过"
+fi
+
+hdr "4. 文件内容 (空 cookie = 无效授权)"
+if [ -r "$XAUTH" ]; then
+    SZ=$(stat -c '%s' "$XAUTH" 2>/dev/null || stat -f '%z' "$XAUTH" 2>/dev/null || echo "?")
+    if [ "$SZ" = "0" ] || [ "$SZ" = "?" ]; then
+        fail "文件为空或读不到大小  ->  空 cookie, X server 会拒绝授权"
+    else
+        ok "文件非空 ($SZ 字节)  ->  cookie 大概率有效"
+    fi
+
+    # 用 xauth 验证 cookie 是否真的能用
+    if command -v xauth >/dev/null 2>&1; then
+        echo "${DIM}-- xauth -f <file> list --${RST}"
+        xauth -f "$XAUTH" list 2>&1 | head -3
+        if xauth -f "$XAUTH" list 2>/dev/null | grep -q '\.'; then
+            ok "cookie 解析成功, 授权文件有效"
+        else
+            fail "xauth 列不出条目  ->  cookie 损坏或格式不对"
+        fi
+    fi
+else
+    fail "当前用户读不了 $XAUTH"
+    fail "  -> 如果 slave setuid 到桌面用户后仍读不了, 就是权限位问题"
+    fail "  -> 如果 agent (root) 也读不了 (理论上 root 能读任何文件), 那就是 ACL/SELinux"
+fi
+
+hdr "5. setuid 模拟 (最贴近 agent slave 的真实场景)"
+# agent slave 的行为: root fork -> setuid(桌面用户) -> 读 .Xauthority
+# 我们模拟: 如果切到桌面用户后还能不能读
+DESKTOP_USER=$(echo "$XAUTH" | sed -n 's|^\(/home/[^/]*\)/.*|\1|p' | xargs basename 2>/dev/null)
+if [ -n "$DESKTOP_USER" ]; then
+    echo "推测桌面用户: $DESKTOP_USER"
+    if [ "$DESKTOP_USER" = "$CURRENT_USER" ]; then
+        ok "你就是桌面用户本人, 上面能读就等于 slave setuid 后能读"
+    else
+        warn "你不是 $DESKTOP_USER, 没法直接模拟 setuid"
+        warn "但关键看权限位: 如果 other 位有 r (如 644), 任何用户都能读"
+        warn "如果只有 owner 有 rw (如 600), slave 必须 setuid 到 $DESKTOP_USER 才能读"
+    fi
+fi
+
+# =============================================================================
+hdr "判定"
+echo
+echo "${CYN}把上面 1-5 段的结果拍照/手打给我, 我就能确定:${RST}"
+echo "  - 如果属主是 root / 权限是 000 / 文件为空  ->  getXInfo 拿到的路径无效, 要改 JS 探测逻辑"
+echo "  - 如果属主是 goushan 且权限 600/700 且非空  ->  agent 应该能读到, 问题在别处, 必须 slave 日志"
+echo "  - 如果有 immutable/ACL 拦截  ->  UOS 安全加固, 要 root 处理"
+echo
+echo "${DIM}日志: $LOG${RST}"

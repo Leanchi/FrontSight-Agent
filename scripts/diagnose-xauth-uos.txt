@@ -1,0 +1,245 @@
+#!/bin/bash
+# ---- CRLF 自愈: 传输若带入 \r, 就地清除并重新执行自己 ----
+if grep -q $'\r' "$0" 2>/dev/null; then
+  tmpf=$(mktemp 2>/dev/null) || tmpf="/tmp/.diag.$$.clean"
+  tr -d '\r' < "$0" > "$tmpf" && cat "$tmpf" > "$0" && rm -f "$tmpf"
+  exec "$0" "$@"
+fi
+
+# =============================================================================
+# X 授权深度诊断 (UOS / 非特权)
+#
+# 用途: 在前一轮诊断确认 XAUTH_MISSING=1 之后, 精确定位 getXInfo 失败的具体环节.
+#       区分以下子分支:
+#         a. Xorg 启动参数有没有 -auth
+#         b. 桌面用户的 .Xauthority 文件到底在哪
+#         c. 能不能读别的进程的 /proc/<pid>/environ (hidepid 检测)
+#
+# 用法:
+#   chmod +x diagnose-xauth-uos.sh
+#   ./diagnose-xauth-uos.sh
+#
+# 输出同时写到屏幕和 /tmp/xauth-diagnose-<时间戳>.log
+# =============================================================================
+
+set -u
+
+LOG="/tmp/xauth-diagnose-$(date +%Y%m%d-%H%M%S).log"
+exec > >(tee -a "$LOG") 2>&1
+
+RED=$'\033[1;31m'
+GRN=$'\033[1;32m'
+YEL=$'\033[1;33m'
+CYN=$'\033[1;36m'
+DIM=$'\033[2m'
+RST=$'\033[0m'
+
+ok()   { echo "${GRN}[ OK ]${RST} $*"; }
+fail() { echo "${RED}[FAIL]${RST} $*"; }
+warn() { echo "${YEL}[WARN]${RST} $*"; }
+hdr()  { echo; echo "${CYN}========== $* ==========${RST}"; }
+
+echo "X 授权深度诊断"
+echo "时间: $(date)   主机: $(hostname)   用户: $(id 2>/dev/null)"
+echo "日志: $LOG"
+
+# 追踪结论
+FOUND_XAUTH_PATH=""
+HIDEPID_SUSPECTED=0
+XORG_HAS_AUTH=0
+
+# -----------------------------------------------------------------------------
+# 1. Xorg 启动参数 (子分支 a)
+#    代码: monitor-info.js:590  ps -e -o uid -o tty -o command | grep X
+#          然后用 awk 匹配 -auth <path>
+# -----------------------------------------------------------------------------
+hdr "1. Xorg 进程启动参数 (有没有 -auth)"
+
+echo "${DIM}-- ps 找 Xorg/X :N --${RST}"
+XORG_LINES=$(ps -e -o uid,tty,command 2>/dev/null | grep -E '[X]org|^[[:space:]]*[0-9]+[[:space:]]+[?a-z]*[[:space:]]*X[[:space:]]+:|/Xorg|X :[0-9]' | grep -v grep)
+if [ -n "$XORG_LINES" ]; then
+    echo "$XORG_LINES"
+    if echo "$XORG_LINES" | grep -q -- '-auth'; then
+        ok "Xorg 启动参数里有 -auth  ->  getXInfo 第一步本应能拿到"
+        XORG_HAS_AUTH=1
+        AUTH_IN_PS=$(echo "$XORG_LINES" | sed -n 's/.*-auth[[:space:]]\+\([^ ]*\).*/\1/p' | head -1)
+        [ -n "$AUTH_IN_PS" ] && echo "   ps 里解析出的 -auth 路径: $AUTH_IN_PS"
+    else
+        warn "Xorg 在跑, 但启动参数里没有 -auth  ->  deepin/UOS 的 lightdm 启动方式不同"
+        warn "   monitor-info.js:590 的 awk 匹配不到, 第一步直接失败"
+    fi
+else
+    warn "没找到 Xorg 进程  ->  可能在用 Xwayland 或 Wayland 会话"
+    warn "   这种情况下 meshagent 的 X11 抓屏本就不可用"
+fi
+
+# -----------------------------------------------------------------------------
+# 2. .Xauthority 文件位置 (子分支 b)
+#    代码: monitor-info.js:681  getHomeFolder(uid) + '/.Xauthority'
+#          733  /run/lightdm/<user>/xauthority
+#          737  /run/sddm/...
+# -----------------------------------------------------------------------------
+hdr "2. X 授权文件位置扫描"
+
+echo "${DIM}-- 当前用户家目录 --${RST}"
+if [ -f ~/.Xauthority ]; then
+    sz=$(stat -c '%s' ~/.Xauthority 2>/dev/null || stat -f '%z' ~/.Xauthority 2>/dev/null)
+    ok "~/.Xauthority 存在 ($sz 字节)  ->  $HOME/.Xauthority"
+    [ -n "$FOUND_XAUTH_PATH" ] || FOUND_XAUTH_PATH="$HOME/.Xauthority"
+else
+    fail "~/.Xauthority 不存在"
+fi
+
+echo "${DIM}-- /home 下所有用户的 .Xauthority --${RST}"
+for f in /home/*/.Xauthority /root/.Xauthority; do
+    if [ -e "$f" ]; then
+        owner=$(stat -c '%U' "$f" 2>/dev/null || echo "?")
+        sz=$(stat -c '%s' "$f" 2>/dev/null || stat -f '%z' "$f" 2>/dev/null)
+        ok "$f  (属主: $owner, $sz 字节)"
+        [ -n "$FOUND_XAUTH_PATH" ] || FOUND_XAUTH_PATH="$f"
+    fi
+done
+
+echo "${DIM}-- deepin/UOS 常见授权路径 --${RST}"
+for f in /run/lightdm/*/xauthority \
+         /var/run/lightdm/*/xauthority \
+         /run/user/*/gdm/Xauthority \
+         /run/user/*/xauth_* ; do
+    if [ -e "$f" ] 2>/dev/null; then
+        ok "发现: $f"
+        [ -n "$FOUND_XAUTH_PATH" ] || FOUND_XAUTH_PATH="$f"
+    fi
+done 2>/dev/null
+
+# deepin-deepin-greeter / dde-session 常放在 /run/user/<uid>/ 下
+echo "${DIM}-- /run/user/<uid>/ 下的 X 相关文件 --${RST}"
+for d in /run/user/* ; do
+    [ -d "$d" ] || continue
+    for f in "$d"/Xauthority "$d"/xauth_* "$d"/.Xauthority; do
+        if [ -e "$f" ] 2>/dev/null; then
+            ok "发现: $f"
+            [ -n "$FOUND_XAUTH_PATH" ] || FOUND_XAUTH_PATH="$f"
+        fi
+    done 2>/dev/null
+done
+
+if [ -z "$FOUND_XAUTH_PATH" ]; then
+    fail "扫描完所有常见位置都没找到 .Xauthority"
+    fail "  -> getXInfo 的所有 fallback 都会失败, slave 拿不到授权必崩"
+fi
+
+# -----------------------------------------------------------------------------
+# 3. 能不能读别的进程的 /proc/<pid>/environ (hidepid 检测)
+#    代码: monitor-info.js:773,815  readFileSync('/proc/<pid>/environ')
+#          user-sessions.js:1150    cat /proc/<pid>/environ
+# -----------------------------------------------------------------------------
+hdr "3. /proc/<pid>/environ 可读性 (hidepid 检测)"
+
+echo "${DIM}-- /proc 挂载选项 (看有没有 hidepid) --${RST}"
+MOUNT_OPT=$(mount 2>/dev/null | grep ' on /proc ' | head -1)
+echo "$MOUNT_OPT"
+if echo "$MOUNT_OPT" | grep -q 'hidepid='; then
+    hp=$(echo "$MOUNT_OPT" | sed -n 's/.*hidepid=\([0-9]\).*/\1/p')
+    if [ "$hp" = "2" ]; then
+        fail "/proc 挂了 hidepid=2  ->  即使 root 也读不到别的会话进程的 environ"
+        fail "  monitor-info.js 的兜底 (遍历进程读 environ) 全部失效"
+        HIDEPID_SUSPECTED=1
+    elif [ "$hp" = "1" ]; then
+        warn "/proc 挂了 hidepid=1  ->  部分限制, root 通常仍可读"
+    fi
+else
+    ok "/proc 没有 hidepid"
+fi
+
+echo "${DIM}-- 找一个桌面进程试着读它的 environ --${RST}"
+DESKTOP_PID=$(ps -e -o pid,comm 2>/dev/null | grep -iE 'dde-desktop|deepin|dde-session|dde-dock|startdde|lightdm' | grep -v grep | head -1 | awk '{print $1}')
+if [ -n "$DESKTOP_PID" ]; then
+    echo "桌面进程: $(ps -p $DESKTOP_PID -o comm= 2>/dev/null)  PID=$DESKTOP_PID"
+    if [ -r "/proc/$DESKTOP_PID/environ" ]; then
+        ok "能读 /proc/$DESKTOP_PID/environ"
+        echo "${DIM}-- 从中提取 DISPLAY / XAUTHORITY (这正是 meshagent 想做的事) --${RST}"
+        tr '\0' '\n' < /proc/$DESKTOP_PID/environ 2>/dev/null | grep -E '^(DISPLAY|XAUTHORITY)=' || echo "  (environ 里没有这两个变量)"
+        ENV_DISPLAY=$(tr '\0' '\n' < /proc/$DESKTOP_PID/environ 2>/dev/null | grep '^DISPLAY=' | head -1 | cut -d= -f2)
+        ENV_XAUTH=$(tr '\0' '\n' < /proc/$DESKTOP_PID/environ 2>/dev/null | grep '^XAUTHORITY=' | head -1 | cut -d= -f2)
+        [ -n "$ENV_XAUTH" ] && ok "从桌面进程 environ 拿到 XAUTHORITY: $ENV_XAUTH"
+    else
+        fail "读不了 /proc/$DESKTOP_PID/environ  ->  hidepid 或权限限制"
+        HIDEPID_SUSPECTED=1
+    fi
+else
+    warn "没找到 dde/deepin 桌面进程 (可能没登录, 或进程名不同)"
+fi
+
+# -----------------------------------------------------------------------------
+# 4. 直接用找到的授权连一下 X (终极验证)
+# -----------------------------------------------------------------------------
+hdr "4. 用找到的授权实测连接 X server"
+
+if [ -z "$FOUND_XAUTH_PATH" ]; then
+    fail "前面没找到任何授权文件, 跳过"
+else
+    if command -v xdpyinfo >/dev/null 2>&1; then
+        for disp in ":0" ":1" "${ENV_DISPLAY:-}"; do
+            [ -z "$disp" ] && continue
+            echo "${DIM}-- 试 DISPLAY=$disp XAUTHORITY=$FOUND_XAUTH_PATH --${RST}"
+            if DISPLAY="$disp" XAUTHORITY="$FOUND_XAUTH_PATH" xdpyinfo >/dev/null 2>&1; then
+                ok "✓ 连上了!  DISPLAY=$disp XAUTHORITY=$FOUND_XAUTH_PATH"
+                ok "  这说明授权文件本身有效, 问题就是 meshagent 没找到它"
+                break
+            else
+                warn "✗ DISPLAY=$disp 连不上"
+            fi
+        done
+    elif command -v xset >/dev/null 2>&1; then
+        for disp in ":0" ":1"; do
+            if DISPLAY="$disp" XAUTHORITY="$FOUND_XAUTH_PATH" xset q >/dev/null 2>&1; then
+                ok "✓ 连上了!  DISPLAY=$disp XAUTHORITY=$FOUND_XAUTH_PATH"
+                break
+            fi
+        done
+    else
+        warn "既没有 xdpyinfo 也没有 xset, 跳过连接测试"
+        warn "但只要前面找到了有效的 .Xauthority 文件, meshagent 就有修复路径"
+    fi
+fi
+
+# -----------------------------------------------------------------------------
+# 判读
+# -----------------------------------------------------------------------------
+hdr "诊断判读"
+
+echo "汇总: XORG_HAS_AUTH=$XORG_HAS_AUTH  找到授权=$FOUND_XAUTH_PATH  hidepid嫌疑=$HIDEPID_SUSPECTED"
+echo
+
+if [ -n "$FOUND_XAUTH_PATH" ] && [ "$HIDEPID_SUSPECTED" = "0" ]; then
+    echo "${GRN}>>> 最可能: getXInfo 的探测逻辑在 UOS 上没走对路${RST}"
+    echo "    授权文件确实存在: $FOUND_XAUTH_PATH"
+    echo "    但 monitor-info.js 的 ps|grep X 第一步匹配不到 deepin 的 lightdm 启动方式,"
+    echo "    后续 fallback 又因为各种小差异没命中, 最终 updateXAuth=NULL."
+    echo
+    echo "${CYN}修复方向 (不需要 UOS root):${RST}"
+    echo "  在 monitor-info.js 的 getXInfo 里增加 UOS/deepin 专用探测路径,"
+    echo "  或直接加一条: 如果其他都失败, 扫描 /run/user/*/ 和 /home/*/.Xauthority."
+    echo "  这是纯 JS 改动, 重新打包 deb 即可, 目标机不需要装任何东西."
+    echo
+fi
+
+if [ "$HIDEPID_SUSPECTED" = "1" ]; then
+    echo "${RED}>>> 命中: hidepid 安全加固阻止读 environ${RST}"
+    echo "    /proc 挂了 hidepid, getXInfo 的进程遍历兜底全部失效."
+    echo "    这种情况下纯 JS 改动救不回来, 需要 UOS root 改挂载选项或 systemd unit:"
+    echo "      systemd unit 里加:  ProcSubset=all"
+    echo "      或管理员改 /etc/fstab 里 /proc 的 hidepid=2 -> hidepid=0"
+    echo
+fi
+
+if [ -z "$FOUND_XAUTH_PATH" ]; then
+    echo "${RED}>>> 严重: 系统上根本找不到任何 .Xauthority${RST}"
+    echo "    可能是 Wayland 纯会话 (meshagent 的 X11 抓屏对此不可用),"
+    echo "    或授权放在非常规路径. 把第 2 段扫描结果发回来进一步分析."
+    echo
+fi
+
+echo
+echo "${DIM}完整日志: $LOG${RST}"
+echo "${DIM}内网传不出来也没关系, 把 '诊断判读' 那段拍照/手打给我就够.${RST}"
