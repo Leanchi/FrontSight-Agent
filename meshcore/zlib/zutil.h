@@ -137,7 +137,9 @@ extern z_const char * const z_errmsg[10]; /* indexed by 2-zlib_error */
 #      include <unix.h> /* for fdopen */
 #    else
 #      ifndef fdopen
-#        define fdopen(fd,mode) NULL /* No fdopen() */
+#        if !defined(__APPLE__)
+#          define fdopen(fd,mode) NULL /* No fdopen() */
+#        endif /* !__APPLE__: 现代 macOS 有真实 fdopen，不能宏屏蔽（Xcode 26 SDK 下 TARGET_OS_MAC 会被传递定义，屏蔽会炸 _stdio.h 声明） */
 #      endif
 #    endif
 #  endif

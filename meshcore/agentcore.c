@@ -2093,7 +2093,16 @@ void ILibDuktape_MeshAgent_Init(duk_context* ctx, void *chain, MeshAgentHostCont
 	duk_put_prop_string(ctx, -2, "MeshAgentPtr");	// [stash]
 	duk_pop(ctx);									// ...
 	ILibDuktape_ModSearch_AddHandler(ctx, "MeshAgent", ILibDuktape_MeshAgent_PUSH);
-	ILibDuktape_ModSearch_AddHandler(ctx, "paintbrush-overlay", paintbrush_overlay_PUSH);
+	/* paintbrush-overlay 红笔模块：三平台导出同名 paintbrush_overlay_PUSH，
+	 * 由 makefile/.sln 按平台各链接一个实现文件（见 makefile 各目标 ADDITIONALSOURCES） */
+#if defined(WIN32)
+	ILibDuktape_ModSearch_AddHandler(ctx, "paintbrush-overlay", paintbrush_overlay_PUSH);	/* GDI+ 实现 paintbrush_overlay_win.cpp */
+#elif defined(__APPLE__)
+	ILibDuktape_ModSearch_AddHandler(ctx, "paintbrush-overlay", paintbrush_overlay_PUSH);	/* objc/CoreGraphics 实现 paintbrush_overlay_mac.c */
+#elif defined(__linux__)
+	ILibDuktape_ModSearch_AddHandler(ctx, "paintbrush-overlay", paintbrush_overlay_PUSH);	/* X11 ARGB 实现 paintbrush_overlay.c */
+#endif
+	/* 其余平台（BSD 等）不编译 overlay 实现，也不注册模块 */
 }
 
 /* ------------------------------ 
@@ -5938,7 +5947,14 @@ void MeshAgent_ScriptMode(MeshAgentHostContainer *agentHost, int argc, char **ar
 		duk_put_prop_string(agentHost->meshCoreCtx, -2, "\xFF_MeshDesktop_AgentPtr");	// [stash]
 		duk_pop(agentHost->meshCoreCtx);												// ...
 		ILibDuktape_ModSearch_AddHandler(agentHost->meshCoreCtx, "meshDesktop", MeshAgent_ScriptMode_MeshDesktop_PUSH);
+		/* paintbrush-overlay 红笔模块：平台条件编译（与 ILibDuktape_MeshAgent_Init 处一致） */
+#if defined(WIN32)
 		ILibDuktape_ModSearch_AddHandler(agentHost->meshCoreCtx, "paintbrush-overlay", paintbrush_overlay_PUSH);
+#elif defined(__APPLE__)
+		ILibDuktape_ModSearch_AddHandler(agentHost->meshCoreCtx, "paintbrush-overlay", paintbrush_overlay_PUSH);
+#elif defined(__linux__)
+		ILibDuktape_ModSearch_AddHandler(agentHost->meshCoreCtx, "paintbrush-overlay", paintbrush_overlay_PUSH);
+#endif
 
 		duk_push_global_object(agentHost->meshCoreCtx);									// [g]
 		duk_push_c_function(agentHost->meshCoreCtx, MeshAgent_ScriptMode_StartAgent, 0);// [g][startAgent]
