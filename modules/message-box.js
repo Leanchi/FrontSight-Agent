@@ -685,6 +685,50 @@ if (process.platform == 'darwin')
         Buffer.from(j).copy(b, 4);
         return (b);
     }
+
+    // Decodes the length-prefixed framing used on the message-box IPC sockets:
+    //   [uint32 LE total frame length (including the 4 byte header)][JSON payload]
+    // Hardening (2026-09-18):
+    //   * Buffers partial frames across multiple 'data' chunks (the old code used buffer.len,
+    //     which is undefined on Duktape Buffer, so every length check was a no-op and
+    //     truncated/garbage chunks went straight into JSON.parse)
+    //   * Splits multiple frames coalesced into a single chunk
+    //   * Parse failures are routed to onProtocolError instead of throwing out of the
+    //     'data' handler (which surfaced as UncaughtException: invalid json)
+    // onFrame returning false stops processing (connection is being torn down).
+    function decodeFrames(sock, buffer, onFrame, onProtocolError)
+    {
+        try
+        {
+            if (sock._mbrx != null && sock._mbrx.length > 0)
+            {
+                buffer = Buffer.concat([sock._mbrx, buffer]);
+            }
+            sock._mbrx = null;
+            while (buffer.length >= 4)
+            {
+                var flen = buffer.readUInt32LE(0);
+                if (flen < 4 || flen > 1048576) { onProtocolError(sock, 'invalid frame length'); return; }
+                if (buffer.length < flen) { break; }
+                var p = null;
+                try { p = JSON.parse(buffer.slice(4, flen).toString()); }
+                catch (e) { onProtocolError(sock, 'invalid json'); return; }
+                if (p == null || typeof p != 'object') { onProtocolError(sock, 'invalid json'); return; }
+                if (onFrame(sock, p) === false) { return; }
+                buffer = buffer.slice(flen);
+            }
+            // NOTE: The 'data' event buffer is backed by memory that is freed once the handler
+            // returns (ILibDuktape_readableStream frees the backing allocation right after emit),
+            // so a partial frame must be retained as a private copy. Buffer.concat() always
+            // allocates a fresh buffer and copies, which is exactly what we need here.
+            sock._mbrx = (buffer.length > 0 ? Buffer.concat([buffer]) : null);
+        }
+        catch (e)
+        {
+            try { sock._mbrx = null; } catch (e0) { }
+            try { onProtocolError(sock, 'decoder error'); } catch (e2) { }
+        }
+    }
 }
 
 function macos_messageBox()
@@ -833,34 +877,50 @@ function macos_messageBox()
         {
             this._connection = c;
             c.promise = this.ret;
+            c.on('end', function ()
+            {
+                // Helper closed the connection without delivering a complete frame
+                // (e.g. killed mid-write). Settle the dialog instead of hanging; duplicate
+                // settles are ignored by the promise implementation, so the normal
+                // DIALOG/ERROR flow is unaffected.
+                try { this.promise._rej('Connection closed'); } catch (e) { }
+                try { this.promise.server.close(); } catch (e) { }
+            });
             c.on('data', function (buffer)
             {
-                if (buffer.len < 4 || buffer.readUInt32LE(0) > buffer.len) { this.unshift(buffer); }
-                var p = JSON.parse(buffer.slice(4, buffer.readUInt32LE(0)).toString());
-                switch (p.command)
+                decodeFrames(this, buffer, function (sock, p)
                 {
-                    case 'ERROR':
-                        this.promise._rej(p.reason);
-                        break;
-                    case 'DIALOG':
-                        if (p.timeout)
-                        {
-                            this.promise._rej('TIMEOUT');
-                        }
-                        else
-                        {
-                            if (p.button == 'Yes' || p.button == 'OK' || this.promise.layout.user)
+                    switch (p.command)
+                    {
+                        case 'ERROR':
+                            sock.promise._rej(p.reason);
+                            break;
+                        case 'DIALOG':
+                            if (p.timeout)
                             {
-                                this.promise._res(p.button);
+                                sock.promise._rej('TIMEOUT');
                             }
                             else
                             {
-                                this.promise._rej('denied');
+                                if (p.button == 'Yes' || p.button == 'OK' || sock.promise.layout.user)
+                                {
+                                    sock.promise._res(p.button);
+                                }
+                                else
+                                {
+                                    sock.promise._rej('denied');
+                                }
                             }
-                        }
-                        break;
-                }
-                this.promise.server.close();
+                            break;
+                    }
+                    sock.promise.server.close();
+                    return (false);
+                },
+                function (sock, err)
+                {
+                    try { sock.promise._rej('Protocol Error: ' + err); } catch (e) { }
+                    try { sock.promise.server.close(); } catch (e) { }
+                });
             });
             for (var x in this.ret.layout)
             {
@@ -911,24 +971,37 @@ function macos_messageBox()
         {
             this._connection = c;
             c.promise = this.ret;
-            c.on('end', function () { this.promise.server.close(); });
+            c.on('end', function ()
+            {
+                // Peer closed without delivering a complete frame (e.g. helper killed mid-write).
+                // Settle the promise instead of leaving it dangling; duplicate settles are
+                // ignored by the promise implementation, so the normal flow is unaffected.
+                try { this.promise._rej('Connection closed'); } catch (e) { }
+                try { this.promise.server.close(); } catch (e) { }
+            });
             c.on('data', function (buffer)
             {
-                if (buffer.len < 4 || buffer.readUInt32LE(0) > buffer.len) { this.unshift(buffer); }
-                var p = JSON.parse(buffer.slice(4, buffer.readUInt32LE(0)).toString());
-                switch (p.command)
+                decodeFrames(this, buffer, function (sock, p)
                 {
-                    case 'writeClip':
-                        if (p.clipError)
-                        {
-                            this.promise._rej(p.clipError);
-                        }
-                        else
-                        {
-                            this.promise._res();
-                        }
-                        break;
-                }
+                    switch (p.command)
+                    {
+                        case 'writeClip':
+                            if (p.clipError)
+                            {
+                                sock.promise._rej(p.clipError);
+                            }
+                            else
+                            {
+                                sock.promise._res();
+                            }
+                            break;
+                    }
+                },
+                function (sock, err)
+                {
+                    try { sock.promise._rej('Protocol Error: ' + err); } catch (e) { }
+                    try { sock.promise.server.close(); } catch (e) { }
+                });
             });
             c.write(translateObject({ command: 'writeClip', clipText: this.clipText }));
         });
@@ -982,24 +1055,37 @@ function macos_messageBox()
         {
             this._connection = c;
             c.promise = this.ret;
-            c.on('end', function () { this.promise.server.close(); });
+            c.on('end', function ()
+            {
+                // Peer closed without delivering a complete frame (e.g. helper killed mid-write).
+                // Settle the promise instead of leaving it dangling; duplicate settles are
+                // ignored by the promise implementation, so the normal flow is unaffected.
+                try { this.promise._rej('Connection closed'); } catch (e) { }
+                try { this.promise.server.close(); } catch (e) { }
+            });
             c.on('data', function (buffer)
             {
-                if (buffer.len < 4 || buffer.readUInt32LE(0) > buffer.len) { this.unshift(buffer); }
-                var p = JSON.parse(buffer.slice(4, buffer.readUInt32LE(0)).toString());
-                switch (p.command)
+                decodeFrames(this, buffer, function (sock, p)
                 {
-                    case 'readClip':
-                        if (p.clipError)
-                        {
-                            this.promise._rej(p.clipError);
-                        }
-                        else
-                        {
-                            this.promise._res(p.clipValue);
-                        }
-                        break;
-                }
+                    switch (p.command)
+                    {
+                        case 'readClip':
+                            if (p.clipError)
+                            {
+                                sock.promise._rej(p.clipError);
+                            }
+                            else
+                            {
+                                sock.promise._res(p.clipValue);
+                            }
+                            break;
+                    }
+                },
+                function (sock, err)
+                {
+                    try { sock.promise._rej('Protocol Error: ' + err); } catch (e) { }
+                    try { sock.promise.server.close(); } catch (e) { }
+                });
             });
             c.write(translateObject({ command: 'readClip' }));
         });
@@ -1017,20 +1103,33 @@ function macos_messageBox()
         {
             this._connection = c;
             c.promise = this.ret;
-            c.on('end', function () { this.promise.server.close(); });
+            c.on('end', function ()
+            {
+                // Peer closed without delivering a complete frame (e.g. helper killed mid-write).
+                // Settle the promise instead of leaving it dangling; duplicate settles are
+                // ignored by the promise implementation, so the normal flow is unaffected.
+                try { this.promise._rej('Connection closed'); } catch (e) { }
+                try { this.promise.server.close(); } catch (e) { }
+            });
             c.on('data', function (buffer)
             {
-                if (buffer.len < 4 || buffer.readUInt32LE(0) > buffer.len) { this.unshift(buffer); }
-                var p = JSON.parse(buffer.slice(4, buffer.readUInt32LE(0)).toString());
-                switch (p.command)
+                decodeFrames(this, buffer, function (sock, p)
                 {
-                    case 'ERROR':
-                        this.promise._rej(p.reason);
-                        break;
-                    case 'LOCK':
-                        this.promise._res();
-                        break;
-                }
+                    switch (p.command)
+                    {
+                        case 'ERROR':
+                            sock.promise._rej(p.reason);
+                            break;
+                        case 'LOCK':
+                            sock.promise._res();
+                            break;
+                    }
+                },
+                function (sock, err)
+                {
+                    try { sock.promise._rej('Protocol Error: ' + err); } catch (e) { }
+                    try { sock.promise.server.close(); } catch (e) { }
+                });
             });
             c.write(translateObject({ command: 'LOCK' }));
         });
@@ -1070,21 +1169,34 @@ function macos_messageBox()
         {
             this._connection = c;
             c.promise = this.ret;
-            c.on('end', function () { this.promise.server.close(); });
+            c.on('end', function ()
+            {
+                // Peer closed without delivering a complete frame (e.g. helper killed mid-write).
+                // Settle the promise instead of leaving it dangling; duplicate settles are
+                // ignored by the promise implementation, so the normal flow is unaffected.
+                try { this.promise._rej('Connection closed'); } catch (e) { }
+                try { this.promise.server.close(); } catch (e) { }
+            });
             c.on('data', function (buffer)
             {
-                if (buffer.len < 4 || buffer.readUInt32LE(0) > buffer.len) { this.unshift(buffer); }
-                var p = JSON.parse(buffer.slice(4, buffer.readUInt32LE(0)).toString());
-                switch (p.command)
+                decodeFrames(this, buffer, function (sock, p)
                 {
-                    case 'ERROR':
-                        this.promise._rej(p.reason);
-                        break;
-                    case 'NOTIFY':
+                    switch (p.command)
+                    {
+                        case 'ERROR':
+                            sock.promise._rej(p.reason);
+                            break;
+                        case 'NOTIFY':
 
-                        this.promise._res();
-                        break;
-                }
+                            sock.promise._res();
+                            break;
+                    }
+                },
+                function (sock, err)
+                {
+                    try { sock.promise._rej('Protocol Error: ' + err); } catch (e) { }
+                    try { sock.promise.server.close(); } catch (e) { }
+                });
             });
             c.write(translateObject({ command: 'NOTIFY', title: this.ret.title, caption: this.ret.caption }));
         });
@@ -1100,145 +1212,161 @@ function macos_messageBox()
         this.client._options = options;
         this.client.on('data', function (buffer)
         {
-            if (buffer.len < 4 || buffer.readUInt32LE(0) > buffer.len) { this.unshift(buffer); }
-            var p = JSON.parse(buffer.slice(4, buffer.readUInt32LE(0)).toString());
-            switch (p.command)
+            decodeFrames(this, buffer, function (sock, p)
             {
-                case 'writeClip':
-                    this._shell = require('child_process').execFile('/usr/bin/pbcopy', ['pbcopy']);
-                    this._shell.ipc = this;
-                    this._shell.stdout.str = ''; this._shell.stdout.on('data', function (chunk) { this.str += chunk.toString(); });
-                    this._shell.stderr.str = ''; this._shell.stderr.on('data', function (chunk) { this.str += chunk.toString(); });
-                    this._shell.stdin.write(p.clipText, function () { this.end(); });
-                    this._shell.on('exit', function ()
-                    {
-                        if (this.stderr.str != '')
+                switch (p.command)
+                {
+                    case 'writeClip':
+                        sock._shell = require('child_process').execFile('/usr/bin/pbcopy', ['pbcopy']);
+                        sock._shell.ipc = sock;
+                        sock._shell.stdout.str = ''; sock._shell.stdout.on('data', function (chunk) { this.str += chunk.toString(); });
+                        sock._shell.stderr.str = ''; sock._shell.stderr.on('data', function (chunk) { this.str += chunk.toString(); });
+                        sock._shell.stdin.write(p.clipText, function () { this.end(); });
+                        sock._shell.on('exit', function ()
                         {
-                            this.ipc.end(translateObject({ command: 'writeClip', clipError: this.stderr.str }));
-                        }
-                        else
-                        {
-                            this.ipc.end(translateObject({ command: 'writeClip' }));
-                        }
-                    });
-                    break;
-                case 'readClip':
-                    this._shell = require('child_process').execFile('/usr/bin/pbpaste', ['pbpaste']);
-                    this._shell.stdout.str = ''; this._shell.stdout.on('data', function (chunk) { this.str += chunk.toString(); });
-                    this._shell.stderr.str = ''; this._shell.stderr.on('data', function (chunk) { this.str += chunk.toString(); });
-                    this._shell.waitExit();
-                    if (this._shell.stderr.str != '')
-                    {
-                        this.end(translateObject({ command: 'readClip', clipError: this._shell.stderr.str }));
-                    }
-                    else
-                    {
-                        // if (this._shell.stdout.str.length > 2) { this._shell.stdout.str = this._shell.stdout.str.substring(0, this._shell.stdout.str.length - 2); }
-                        this.end(translateObject({ command: 'readClip', clipValue: this._shell.stdout.str }));
-                    }
-                    break;
-                case 'LOCK':
-                    this._shell = require('child_process').execFile('/bin/sh', ['sh']);
-                    this._shell.stdout.str = ''; this._shell.stdout.on('data', function (chunk) { this.str += chunk.toString(); });
-                    this._shell.stderr.str = ''; this._shell.stderr.on('data', function (chunk) { this.str += chunk.toString(); });
-                    this._shell.stdin.write('/System/Library/CoreServices/Menu\\ Extras/User.menu/Contents/Resources/CGSession -suspend\nexit\n');
-                    this._shell.waitExit();
-                    if (this._shell.stderr.str != '')
-                    {
-                        this.end(translateObject({ command: 'ERROR', reason: this._shell.stderr.str }));
-                    }
-                    else
-                    {
-                        this.end(translateObject({ command: 'LOCK', status: 0 }));
-                    }
-                    break;
-                case 'NOTIFY':
-                    this._shell = require('child_process').execFile('/bin/sh', ['sh']);
-                    this._shell.stdout.str = ''; this._shell.stdout.on('data', function (chunk) { this.str += chunk.toString(); });
-                    this._shell.stderr.str = ''; this._shell.stderr.on('data', function (chunk) { this.str += chunk.toString(); });
-                    this._shell.stdin.write('osascript -e \'tell current application to display notification "' + p.caption + '" with title "' + p.title + '"\'\nexit\n');
-                    this._shell.waitExit();
-                    if (this._shell.stderr.str != '')
-                    {
-                        this.end(translateObject({ command: 'ERROR', reason: this._shell.stderr.str }));
-                    }
-                    else
-                    {
-                        this.end(translateObject({ command: 'NOTIFY', status: 0 }));
-                    }
-                    break;
-                case 'DIALOG':
-                    var timeout = p.timeout ? (' giving up after ' + p.timeout) : '';
-                    var icon = p.icon ? ('with icon ' + p.icon) : '';
-
-                    var buttons = p.buttons ? ('buttons {' + p.buttons.toString() + '}') : '';
-                    if (p.buttonDefault != null)
-                    {
-                        buttons += (' default button ' + p.buttonDefault)
-                    }
-                    this._shell = require('child_process').execFile('/bin/sh', ['sh']);
-                    this._shell.that = this;
-                    this._shell.stdout.str = ''; this._shell.stdout.on('data', function (chunk) { this.str += chunk.toString(); });
-                    this._shell.stderr.str = ''; this._shell.stderr.on('data', function (chunk) { this.str += chunk.toString(); });
-                    this._shell.stdin.write('osascript -e \'tell current application to display dialog "' + p.caption + '" with title "' + p.title + '" ' + icon + ' ' + buttons + timeout + '\' | awk \'{ c=split($0, tokens, ","); split(tokens[1], val, ":"); if(c==1) { print val[2] } else { split(tokens[2], gu, ":"); if(gu[2]=="true") { print "_TIMEOUT_" } else { print val[2]  }  } }\'\nexit\n');
-                    this._shell.on('exit', function ()
-                    {
-                        if (this.stderr.str != '' && !this.stderr.str.includes('OpenGL'))
-                        {
-                            if (this.stderr.str.includes('(-128)'))
+                            if (this.stderr.str != '')
                             {
-                                this.that.end(translateObject({ command: 'DIALOG', button: 'Cancel' }));
+                                this.ipc.end(translateObject({ command: 'writeClip', clipError: this.stderr.str }));
                             }
                             else
                             {
-                                this.that.end(translateObject({ command: 'ERROR', reason: this.stderr.str }));
+                                this.ipc.end(translateObject({ command: 'writeClip' }));
                             }
+                        });
+                        break;
+                    case 'readClip':
+                        sock._shell = require('child_process').execFile('/usr/bin/pbpaste', ['pbpaste']);
+                        sock._shell.stdout.str = ''; sock._shell.stdout.on('data', function (chunk) { this.str += chunk.toString(); });
+                        sock._shell.stderr.str = ''; sock._shell.stderr.on('data', function (chunk) { this.str += chunk.toString(); });
+                        sock._shell.waitExit();
+                        if (sock._shell.stderr.str != '')
+                        {
+                            sock.end(translateObject({ command: 'readClip', clipError: sock._shell.stderr.str }));
                         }
                         else
                         {
-                            if (this.stdout.str.trim() == '_TIMEOUT_')
+                            // if (sock._shell.stdout.str.length > 2) { sock._shell.stdout.str = sock._shell.stdout.str.substring(0, sock._shell.stdout.str.length - 2); }
+                            sock.end(translateObject({ command: 'readClip', clipValue: sock._shell.stdout.str }));
+                        }
+                        break;
+                    case 'LOCK':
+                        sock._shell = require('child_process').execFile('/bin/sh', ['sh']);
+                        sock._shell.stdout.str = ''; sock._shell.stdout.on('data', function (chunk) { this.str += chunk.toString(); });
+                        sock._shell.stderr.str = ''; sock._shell.stderr.on('data', function (chunk) { this.str += chunk.toString(); });
+                        sock._shell.stdin.write('/System/Library/CoreServices/Menu\\ Extras/User.menu/Contents/Resources/CGSession -suspend\nexit\n');
+                        sock._shell.waitExit();
+                        if (sock._shell.stderr.str != '')
+                        {
+                            sock.end(translateObject({ command: 'ERROR', reason: sock._shell.stderr.str }));
+                        }
+                        else
+                        {
+                            sock.end(translateObject({ command: 'LOCK', status: 0 }));
+                        }
+                        break;
+                    case 'NOTIFY':
+                        sock._shell = require('child_process').execFile('/bin/sh', ['sh']);
+                        sock._shell.stdout.str = ''; sock._shell.stdout.on('data', function (chunk) { this.str += chunk.toString(); });
+                        sock._shell.stderr.str = ''; sock._shell.stderr.on('data', function (chunk) { this.str += chunk.toString(); });
+                        sock._shell.stdin.write('osascript -e \'tell current application to display notification "' + p.caption + '" with title "' + p.title + '"\'\nexit\n');
+                        sock._shell.waitExit();
+                        if (sock._shell.stderr.str != '')
+                        {
+                            sock.end(translateObject({ command: 'ERROR', reason: sock._shell.stderr.str }));
+                        }
+                        else
+                        {
+                            sock.end(translateObject({ command: 'NOTIFY', status: 0 }));
+                        }
+                        break;
+                    case 'DIALOG':
+                        var timeout = p.timeout ? (' giving up after ' + p.timeout) : '';
+                        var icon = p.icon ? ('with icon ' + p.icon) : '';
+
+                        var buttons = p.buttons ? ('buttons {' + p.buttons.toString() + '}') : '';
+                        if (p.buttonDefault != null)
+                        {
+                            buttons += (' default button ' + p.buttonDefault)
+                        }
+                        sock._shell = require('child_process').execFile('/bin/sh', ['sh']);
+                        sock._shell.that = sock;
+                        sock._shell.stdout.str = ''; sock._shell.stdout.on('data', function (chunk) { this.str += chunk.toString(); });
+                        sock._shell.stderr.str = ''; sock._shell.stderr.on('data', function (chunk) { this.str += chunk.toString(); });
+                        sock._shell.stdin.write('osascript -e \'tell current application to display dialog "' + p.caption + '" with title "' + p.title + '" ' + icon + ' ' + buttons + timeout + '\' | awk \'{ c=split($0, tokens, ","); split(tokens[1], val, ":"); if(c==1) { print val[2] } else { split(tokens[2], gu, ":"); if(gu[2]=="true") { print "_TIMEOUT_" } else { print val[2]  }  } }\'\nexit\n');
+                        sock._shell.on('exit', function ()
+                        {
+                            if (this.stderr.str != '' && !this.stderr.str.includes('OpenGL'))
                             {
-                                this.that.end(translateObject({ command: 'DIALOG', timeout: true }));
+                                if (this.stderr.str.includes('(-128)'))
+                                {
+                                    this.that.end(translateObject({ command: 'DIALOG', button: 'Cancel' }));
+                                }
+                                else
+                                {
+                                    this.that.end(translateObject({ command: 'ERROR', reason: this.stderr.str }));
+                                }
                             }
                             else
                             {
-                                this.that.end(translateObject({ command: 'DIALOG', button: this.stdout.str.trim() }));
+                                if (this.stdout.str.trim() == '_TIMEOUT_')
+                                {
+                                    this.that.end(translateObject({ command: 'DIALOG', timeout: true }));
+                                }
+                                else
+                                {
+                                    this.that.end(translateObject({ command: 'DIALOG', button: this.stdout.str.trim() }));
+                                }
                             }
-                        }
-                        this.that._shell = null;
-                    });
-                    this.on('close', function ()
-                    {
-                        if (this._shell) { this._shell.kill(); }
-                    });
+                            this.that._shell = null;
+                        });
+                        sock.on('close', function ()
+                        {
+                            if (sock._shell) { sock._shell.kill(); }
+                        });
 
-                    //this._shell.waitExit();
-                    //if (this._shell.stderr.str != '' && !this._shell.stderr.str.includes('OpenGL'))
-                    //{
-                    //    this.end(translateObject({ command: 'ERROR', reason: this._shell.stderr.str }));
-                    //}
-                    //else
-                    //{
-                    //    if (this._shell.stdout.str.trim() == '_TIMEOUT_')
-                    //    {
-                    //        this.end(translateObject({ command: 'DIALOG', timeout: true }));
-                    //    }
-                    //    else
-                    //    {
-                    //        this.end(translateObject({ command: 'DIALOG', button: this._shell.stdout.str.trim() }));
-                    //    }
-                    //}
-                    break;
-                default:
-                    break;
-            }
+                        //sock._shell.waitExit();
+                        //if (sock._shell.stderr.str != '' && !sock._shell.stderr.str.includes('OpenGL'))
+                        //{
+                        //    sock.end(translateObject({ command: 'ERROR', reason: sock._shell.stderr.str }));
+                        //}
+                        //else
+                        //{
+                        //    if (sock._shell.stdout.str.trim() == '_TIMEOUT_')
+                        //    {
+                        //        sock.end(translateObject({ command: 'DIALOG', timeout: true }));
+                        //    }
+                        //    else
+                        //    {
+                        //        sock.end(translateObject({ command: 'DIALOG', button: sock._shell.stdout.str.trim() }));
+                        //    }
+                        //}
+                        break;
+                    default:
+                        break;
+                }
+            },
+            function (sock, err)
+            {
+                // Protocol error from the parent: terminate the connection. The 'end'/'error'
+                // chain will uninstall the LaunchAgent and exit cleanly.
+                try { sock.end(); } catch (e) { }
+            });
         });
         this.client.on('error', function () { this.uninstall(); }).on('end', function () { this.uninstall(); });
         this.client.uninstall = function ()
         {
-            // Need to uninstall ourselves
-            var child = require('child_process').execFile(process.execPath, [process.execPath.split('/').pop(), '-exec', "var s=require('service-manager').manager.getLaunchAgent('" + this._options.service + "', " + this._options.uid + "); s.unload(); require('fs').unlinkSync(s.plist);process.exit();"], { detached: true, type: require('child_process').SpawnTypes.DETACHED });
-            child.waitExit();
+            if (this._uninstalled) { return; }
+            this._uninstalled = true;
+            // Need to uninstall ourselves.
+            // NOTE (2026-09-18): Do NOT waitExit() here. This runs from the socket 'error'/'end'
+            // handlers, which fire from within chain disconnect processing (ILibAsyncSocket_Disconnect
+            // -> OnConnect -> emit). Blocking here re-enters the chain (nested ILibChain_Continue),
+            // which re-dispatches the dying socket and recurses until the Duktape value stack is
+            // exhausted -> SIGSEGV (deterministic crash whenever the unix socket path is dead when
+            // the helper connects, e.g. launchd spawns the LaunchAgent after the parent's 5s
+            // 'Connection timeout' already closed the server). The DETACHED child completes the
+            // LaunchAgent removal on its own; the caller's 'end'/'error' wrapper exits the process.
+            var child = require('child_process').execFile(process.execPath, [process.execPath.split('/').pop(), '-exec', "try { var s=require('service-manager').manager.getLaunchAgent('" + this._options.service + "', " + this._options.uid + "); s.unload(); require('fs').unlinkSync(s.plist); } catch (e) { } process.exit();"], { detached: true, type: require('child_process').SpawnTypes.DETACHED });
         };
         return (this.client);
     };
