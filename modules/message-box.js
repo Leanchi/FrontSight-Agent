@@ -895,6 +895,13 @@ function macos_messageBox()
                         case 'ERROR':
                             sock.promise._rej(p.reason);
                             break;
+                        case 'HELLO':
+                            // [2026-09-20 leanchiliu] 握手就绪此刻才写 DIALOG（客户端 data 通路已证明可用）
+                            try
+                            {
+                                sock.write(translateObject({ command: 'DIALOG', title: sock.promise.title, caption: sock.promise.caption, icon: 'caution', buttons: sock.promise.layout, buttonDefault: sock.promise.layout[sock.promise.layout.length - 1], timeout: sock.promise.timeout }));
+                            } catch (e) { }
+                            return (true);
                         case 'DIALOG':
                             if (p.timeout)
                             {
@@ -918,15 +925,26 @@ function macos_messageBox()
                 },
                 function (sock, err)
                 {
-                    try { sock.promise._rej('Protocol Error: ' + err); } catch (e) { }
-                    try { sock.promise.server.close(); } catch (e) { }
+                    // [2026-09-20 leanchiliu] 坏帧容忍：不 reject 不 close——真机实证新连接
+                    // 首帧可能被 C 层搞坏（backing 失效→解码失败），HELLO 每秒重发会送来
+                    // 好帧；此处掐断会让重试永远没机会（'Connection closed' 死循环）。真正的
+                    // 兜底是外层 IPC 窗口超时。
+                    try { sendConsoleText('message-box: 容忍坏帧(' + err + ')，等待重试'); } catch (e) { }
                 });
             });
             for (var x in this.ret.layout)
             {
                 this.ret.layout[x] = '"' + this.ret.layout[x] + '"';
             }
-            c.write(translateObject({ command: 'DIALOG', title: this.ret.title, caption: this.ret.caption, icon: 'caution', buttons: this.ret.layout, buttonDefault: this.ret.layout[this.ret.layout.length-1], timeout: this.ret.timeout }));
+            // [2026-09-20 leanchiliu] HELLO 握手（DIALOG 帧投递竞态终修）：不在
+            // on('connection') 内直接/延迟写 DIALOG——真机实证回环 unix socket 下
+            // 连接内同步 write 与延迟 write 均有帧丢失形态（helper 秒死 'Connection
+            // closed'、data 到达但 backing 失效、data 永不到达，随竞态窗口摆动）。
+            // 改为 helper 连上先发 HELLO（见 startClient connect 分支），服务端
+            // decodeFrames 收到 HELLO 才写 DIALOG（case 'HELLO'）——收到 HELLO 即
+            // 客户端 data 通路已被证明可用，投递确定性由应用层保证。
+            // setClipboard/getClipboard/notify/lock 的 connection 内同步 write 存在
+            // 同款竞态（非 root 剪贴板等路径），后续同法迁移握手。回退：恢复同步 c.write。
         });
         ret.close = function close()
         {
@@ -1210,6 +1228,15 @@ function macos_messageBox()
         options.uid = require('user-sessions').consoleUid();
         this.client = require('net').createConnection(options);
         this.client._options = options;
+        // [2026-09-20 leanchiliu] HELLO 握手 + 重试：连上即发 HELLO，此后每 1s 重发，直到
+        // 收到 DIALOG（收到即去重+停表）——首帧在 C 层投递丢失/悬挂的竞态靠重试兜底
+        //（服务端每个 HELLO 都回一帧 DIALOG，DIALOG 端去重防多弹窗）
+        this.client.on('connect', function ()
+        {
+            var sock = this;
+            try { sock.write(translateObject({ command: 'HELLO' })); } catch (e) { }
+            sock._helloTimer = setInterval(function () { try { sock.write(translateObject({ command: 'HELLO' })); } catch (e) { } }, 1000);
+        });
         this.client.on('data', function (buffer)
         {
             decodeFrames(this, buffer, function (sock, p)
@@ -1280,6 +1307,10 @@ function macos_messageBox()
                         }
                         break;
                     case 'DIALOG':
+                        // [2026-09-20] HELLO 重试会带来重复 DIALOG——去重 + 停 HELLO 定时器
+                        if (sock._dialogActive) { break; }
+                        sock._dialogActive = true;
+                        if (sock._helloTimer) { try { clearInterval(sock._helloTimer); } catch (e) { } sock._helloTimer = null; }
                         var timeout = p.timeout ? (' giving up after ' + p.timeout) : '';
                         var icon = p.icon ? ('with icon ' + p.icon) : '';
 
@@ -1347,9 +1378,9 @@ function macos_messageBox()
             },
             function (sock, err)
             {
-                // Protocol error from the parent: terminate the connection. The 'end'/'error'
-                // chain will uninstall the LaunchAgent and exit cleanly.
-                try { sock.end(); } catch (e) { }
+                // [2026-09-20 leanchiliu] 坏帧容忍（同服务端口径）：不掐连接，等 HELLO
+                // 重试送来好帧；外层 IPC 窗口超时兜底。
+                try { sendConsoleText('message-box helper: 容忍坏帧(' + err + ')，等待重试'); } catch (e) { }
             });
         });
         this.client.on('error', function () { this.uninstall(); }).on('end', function () { this.uninstall(); });
@@ -1380,11 +1411,16 @@ function macos_messageBox()
         ret.uid = require('user-sessions').consoleUid();
         ret.osversion = require('service-manager').getOSVersion();
         ret._options = options;
+        // [2026-09-20 leanchiliu] IPC 连接窗口从固定 5s 改为跟随弹窗超时（+5s 余量）：
+        // macOS 26 launchd 拉起 LaunchAgent 偶发 dyld 启动停滞（spec 实测 pre-main 卡
+        // open 系统调用可达 100s+），5s 固定窗口在真机上常态性误杀慢启动的 helper
+        //（'Connection timeout' reject）。窗口上界=弹窗 giving-up 秒数——弹窗都放弃了
+        // IPC 再留着无意义。回退：恢复 5000。
         ret.timer = setTimeout(function (obj)
         {
             obj.close();
             obj._options._rej('Connection timeout');
-        }, 5000, ret);
+        }, ((options.timeout && parseInt(options.timeout) > 0) ? (parseInt(options.timeout) * 1000 + 5000) : 35000), ret);
         ret.listen(options);
         ret.on('connection', function (c)
         {
@@ -1395,12 +1431,38 @@ function macos_messageBox()
             require('fs').unlinkSync(this._options.path);
         });
 
-        require('service-manager').manager.installLaunchAgent(
+        // [2026-09-20 leanchiliu] helper 拉起双路径：非 root 且本进程已在控制台会话内 →
+        // 直接 spawn 自身副本为 helper 子进程（继承本会话 GUI 上下文，osascript 可用，
+        // 启动 ~40ms）——彻底绕开 launchd 拉起 LaunchAgent 的整类问题（macOS 26 dyld
+        // pre-main 停滞实测 43s+/100s+ 且对无正式签名二进制每次启动评估，真机轮
+        // 'Connection timeout' 反复复现）。root 生产形态（LaunchDaemon）不在控制台
+        // 会话内，仍走 LaunchAgent 跨会话注入（配上方 IPC 窗口延长 + 正式签名交付）。
+        // 回退：删分支恢复无条件 installLaunchAgent。
+        // 自身会话判定用 Self()（mac 上 getProcessOwnerName 不存在，首版分支条件恒假走了 LaunchAgent 回退）
+        var __self = null;
+        try { __self = require('user-sessions').Self(); } catch (e) { }
+        if (__self != null && __self == ret.uid)
+        {
+            try
             {
-                name: options.tmpServiceName, servicePath: process.execPath, startType: 'AUTO_START', uid: ret.uid,
-                sessionTypes: ['Aqua'], parameters: ['-exec', "require('message-box').startClient({ path: '" + options.path + "', service: '" + options.tmpServiceName + "' }).on('end', function () { process.exit(); }).on('error', function () { process.exit(); });"]
-            });
-        require('service-manager').manager.getLaunchAgent(options.tmpServiceName, ret.uid).load();
+                var __exe = process.execPath; // agent fs 无 realpathSync，execPath 本为绝对路径
+                // 注意两点：① agent execFile 的 args[0] 是 argv[0]（程序名），须占位——漏传时
+                // 子进程把首参当程序名、其余当普通参数，-exec/-b64exec 均不生效（实测踩坑）；
+                // ② 脚本用 -b64exec 传（b64 免引号转义，对齐模块内既有 zsh/osascript 拼接惯例）
+                var __b64 = Buffer.from("require('message-box').startClient({ path: '" + options.path + "', service: '" + options.tmpServiceName + "' }).on('end', function () { process.exit(); }).on('error', function () { process.exit(); });").toString('base64');
+                var __child = require('child_process').execFile(__exe, [__exe.split('/').pop(), '-b64exec', __b64]);
+                __child.descriptorMetadata = 'message-box/direct-helper';
+            } catch (e) { }
+        }
+        else
+        {
+            require('service-manager').manager.installLaunchAgent(
+                {
+                    name: options.tmpServiceName, servicePath: process.execPath, startType: 'AUTO_START', uid: ret.uid,
+                    sessionTypes: ['Aqua'], parameters: ['-exec', "require('message-box').startClient({ path: '" + options.path + "', service: '" + options.tmpServiceName + "' }).on('end', function () { process.exit(); }).on('error', function () { process.exit(); });"]
+                });
+            require('service-manager').manager.getLaunchAgent(options.tmpServiceName, ret.uid).load();
+        }
 
         return (ret);
     };
