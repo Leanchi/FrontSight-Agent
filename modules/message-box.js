@@ -798,6 +798,49 @@ function macos_messageBox()
             return (ret);
         }
 
+        // [2026-09-20 leanchiliu] 会话内非 root 直弹（免 sudo 方案，第 41c 项）：
+        // agent 本身就在控制台会话（Self()==consoleUid()，用户手动启动的常见形态）时，
+        // 仿 root 主路径直接 spawn sh+osascript——只是无需 su（本就是该用户 GUI 会话，
+        // D3 实测弹窗可见）。零 IPC/零 LaunchAgent/零 helper，管道 stdout 的 toString()
+        // 实测完好（坏的是 IPC socket 外部缓冲的 toString 桥接——上游边缘路径的框架
+        // 层缺陷，见 2026-09-20 排障记录）。root 走下方原路径；非 root 且不在会话内
+        //（如 SSH 启动）退回 IPC 路径（受上述框架缺陷所阻，待上游修复）。
+        // 回退：删除本分支即回到 IPC-only 行为。
+        var __selfSess = null;
+        try { __selfSess = require('user-sessions').Self(); } catch (eSelf) { }
+        if (__selfSess != null && __selfSess == require('user-sessions').consoleUid())
+        {
+            var pr = new promise(function (res, rej) { this._res = res; this._rej = rej; });
+            try
+            {
+                if (layout == null) { layout = ['Yes', 'No']; }
+                else if (typeof (layout) != 'object') { layout = ['OK']; }
+                var __buttons = 'buttons ' + JSON.stringify(layout).replace('[', '{').replace(']', '}');
+                __buttons += (' default button "' + layout[layout.length - 1] + '"');
+                var __tmo = (' giving up after ' + timeout);
+                var __icon = 'with icon caution';
+                pr.child = require('child_process').execFile('/bin/sh', ['sh']);
+                pr.child.descriptorMetadata = 'message-box/insession';
+                pr.child.promise = pr;
+                pr.child.userLayout = userLayout;
+                pr.child.stdout.str = ''; pr.child.stdout.on('data', function (c) { this.str += c.toString(); });
+                pr.child.on('exit', function ()
+                {
+                    var r = this.stdout.str.split('\x1e');
+                    if (!r[1]) { this.promise._rej('denied'); return; }
+                    r = r[1].trim();
+                    if (r == '_TIMEOUT_') { this.promise._rej('TIMEOUT'); }
+                    else if (this.userLayout || r == 'Yes' || r == 'OK') { this.promise._res(r); }
+                    else { this.promise._rej('denied'); }
+                    this.promise.child = null;
+                });
+                pr.close = function close() { if (this.child) { this.child.kill(); } };
+                pr.child.stdin.write('osascript -e \'tell current application to display dialog "' + caption + '" with title "' + title + '" ' + __icon + ' ' + __buttons + __tmo + '\' | awk \'{ printf "\\x1e"; c=split($0, tokens, ","); split(tokens[1], val, ":"); if(c==1) { print val[2] } else { split(tokens[2], gu, ":"); if(gu[2]=="true") { print "_TIMEOUT_" } else { print val[2]  }  } printf "\\x1e"; }\'\nexit\n');
+                return (pr);
+            }
+            catch (eDlg) { pr._rej(eDlg); return (pr); }
+        }
+
         if (require('user-sessions').isRoot())
         {
             ret = new promise(function (res, rej) { this._res = res; this._rej = rej; });
