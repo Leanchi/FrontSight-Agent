@@ -711,8 +711,21 @@ if (process.platform == 'darwin')
                 if (flen < 4 || flen > 1048576) { onProtocolError(sock, 'invalid frame length'); return; }
                 if (buffer.length < flen) { break; }
                 var p = null;
+                // [2026-09-20 leanchiliu] 终极修复 v2：真机字节级探针实证 IPC socket 外部缓冲的
+                // 字符串转换路径损坏（Buffer.from(d).toString() 返回 null；slice().toString()
+                // 可能返回乱码——两者都使 JSON.parse 失败→"invalid json"丢弃，是 consent 弹窗
+                // 全链路秒断/静默乒乓的共同根因）。索引读/readUInt32LE 完好。策略：先试常规
+                // toString+JSON.parse，失败即逐字节重建（fromCharCode latin-1）+ escape/decode
+                // 还原 UTF-8（不可用则保留 latin-1，JSON 结构与 ASCII 键名仍完好）再解析。
                 try { p = JSON.parse(buffer.slice(4, flen).toString()); }
-                catch (e) { onProtocolError(sock, 'invalid json'); return; }
+                catch (e)
+                {
+                    var __str = '';
+                    for (var ci = 4; ci < flen; ci++) { __str += String.fromCharCode(buffer[ci]); }
+                    try { __str = decodeURIComponent(escape(__str)); } catch (eU) { }
+                    try { p = JSON.parse(__str); }
+                    catch (e2) { onProtocolError(sock, 'invalid json'); return; }
+                }
                 if (p == null || typeof p != 'object') { onProtocolError(sock, 'invalid json'); return; }
                 if (onFrame(sock, p) === false) { return; }
                 buffer = buffer.slice(flen);
@@ -921,6 +934,7 @@ function macos_messageBox()
                             break;
                     }
                     sock.promise.server.close();
+                    if (sock.promise.server._replyTimer != null) { try { clearTimeout(sock.promise.server._replyTimer); } catch (e) { } sock.promise.server._replyTimer = null; }
                     return (false);
                 },
                 function (sock, err)
@@ -1425,6 +1439,18 @@ function macos_messageBox()
         ret.on('connection', function (c)
         {
             clearTimeout(this.timer);
+            // [2026-09-20 leanchiliu] 回复截止兜底：连接建立即清外层窗口定时器，若 helper
+            // 的回复帧丢失（真机实证 helper 连上、osascript 完成、回复不到达），此前无人
+            // 兜底 → 无限悬挂（前端卡"等待同意"）。补一个与窗口同长的回复截止：期内无
+            // DIALOG/ERROR 应答则按 TIMEOUT 结算。结算路径（onFrame 各 case / c.on('end')）
+            // 负责 clearTimeout。
+            var sv = this;
+            if (sv._replyTimer != null) { clearTimeout(sv._replyTimer); }
+            sv._replyTimer = setTimeout(function (obj)
+            {
+                try { obj._options._rej('TIMEOUT'); } catch (e) { }
+                try { obj.close(); } catch (e) { }
+            }, ((sv._options.timeout && parseInt(sv._options.timeout) > 0) ? (parseInt(sv._options.timeout) * 1000 + 5000) : 35000), sv);
         });
         ret.on('~', function ()
         {
@@ -1449,6 +1475,7 @@ function macos_messageBox()
                 // 注意两点：① agent execFile 的 args[0] 是 argv[0]（程序名），须占位——漏传时
                 // 子进程把首参当程序名、其余当普通参数，-exec/-b64exec 均不生效（实测踩坑）；
                 // ② 脚本用 -b64exec 传（b64 免引号转义，对齐模块内既有 zsh/osascript 拼接惯例）
+                // [2026-09-20 临时诊断] helper 生命周期落文件（boot/connected/data/end/error）——真实流程定位连接/收帧失败；排查完还原
                 var __b64 = Buffer.from("require('message-box').startClient({ path: '" + options.path + "', service: '" + options.tmpServiceName + "' }).on('end', function () { process.exit(); }).on('error', function () { process.exit(); });").toString('base64');
                 var __child = require('child_process').execFile(__exe, [__exe.split('/').pop(), '-b64exec', __b64]);
                 __child.descriptorMetadata = 'message-box/direct-helper';
