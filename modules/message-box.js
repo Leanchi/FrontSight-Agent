@@ -1497,7 +1497,10 @@ function macos_messageBox()
         });
         ret.on('~', function ()
         {
-            require('fs').unlinkSync(this._options.path);
+            // [2026-09-20 leanchiliu] 裸 unlinkSync 在 finalizer 里抛 UncaughtException
+            // （真机实录：close() 已删过 / 文件不存在时 ENOENT——"Error in Finalizer
+            // (net.ipcServer)"）。finalizer 异常无消费方，吞掉即可。
+            try { require('fs').unlinkSync(this._options.path); } catch (e) { }
         });
 
         // [2026-09-20 leanchiliu] helper 拉起双路径：非 root 且本进程已在控制台会话内 →

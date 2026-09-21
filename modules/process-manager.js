@@ -29,6 +29,27 @@ function defPromiseHandler(res, rej)
     this._rej = rej;
 }
 
+// [2026-09-20 leanchiliu] waitExit 后的哨兵轮询（09-20-mac-process-enum-timeout）：
+// exit 信号与 stdout 尾段数据可能在同一 select 轮就绪且次序不定——macOS 管道缓冲
+// 64KB，输出超过它（数百进程 ≈ 200KB+）时尾段未派发 waitExit 即返回，紧跟的
+// JSON.parse 必得截断串同步抛异常（真机 6/6 超时实录：回话永不到 + 服务器连接
+// 随异常被拆）。子进程输出流尾部追加哨兵行后，哨兵出现即证其前数据已全部到达
+// （同一管道 FIFO，且哨兵是 sh 顺序执行的最后一个命令）；25ms 轮询通常 1-2 拍
+// 收敛，超时兜底 cb(null)（调用方不回调上层，与旧静默失败行为一致）。
+function waitForOutputSentinel(p, timeoutMs, cb)
+{
+    var PS_SENTINEL = '__PS_DONE__';
+    var tickMs = 25;
+    var elapsed = 0;
+    var timer = setInterval(function ()
+    {
+        var i = p.stdout.str.indexOf(PS_SENTINEL);
+        if (i >= 0) { clearInterval(timer); cb(p.stdout.str.substring(0, i)); return; }
+        elapsed += tickMs;
+        if (elapsed >= timeoutMs) { clearInterval(timer); cb(null); }
+    }, tickMs);
+}
+
 // Used on Windows and Linux to get information about running processes
 function processManager() {
     this._ObjectID = 'process-manager'; // Used for debugging, allows you to get the object type at runtime.
@@ -139,64 +160,73 @@ function processManager() {
                 p.stdin.write('       }');
                 p.stdin.write('   }');
                 p.stdin.write('   printf "}";');
-                p.stdin.write("}'\nexit\n");
+                // [2026-09-20] 哨兵行随 exit 前追加（waitForOutputSentinel，截断竞态修复）
+                p.stdin.write("}'\necho __PS_DONE__\nexit\n");
                 p.waitExit();
-
-                if (p.stderr.str.trim() != '')
+                // [2026-09-20] 透传参数闭包外捕获（哨兵回调的 arguments 不是本函数的）；
+                // 解析推迟到哨兵到达后（原 waitExit 后立即解析在输出 > 管道缓冲 64KB 时
+                // 必截断同步抛——darwin 分支同型，waitForOutputSentinel 头注释）
+                var passthrough = [];
+                for (var ai = 1; ai < arguments.length; ++ai) { passthrough.push(arguments[ai]); }
+                var finishLinux = function (out, fallback)
                 {
-                    fallback = true;
-                    var p = require('child_process').execFile('/bin/sh', ['sh']);
-                    p.stdout.str = ''; p.stdout.on('data', function (c) { this.str += c.toString(); });
-                    p.stderr.str = ''; p.stderr.on('data', function (c) { this.str += c.toString(); });
-                    p.stdin.write("ps | tr '\\n' '`' | awk -F'`' '");
-                    p.stdin.write('{');
-                    p.stdin.write('   len=split($1,A," "); X=index($1,A[len]);');
-                    p.stdin.write('   printf "{"; ');
-                    p.stdin.write('   for(i=2;i<NF;++i)');
-                    p.stdin.write('   {');
-                    p.stdin.write('      split($i,TOK," ");');
-                    p.stdin.write('      cmd=substr($i,X);');
-                    p.stdin.write('      gsub(/\\\\/,"\\\\\\\\",cmd);');
-                    p.stdin.write('      gsub(/"/,"\\\\\\"",cmd);');
-                    p.stdin.write('      printf "%s\\"%s\\":{\\"pid\\":\\"%s\\",\\"user\\":\\"%s\\",\\"cmd\\":\\"%s\\"}",(i==2?"":","),TOK[1],TOK[1],TOK[2],cmd;');
-                    //                                  PID               PID                 USER               command     
-                    p.stdin.write('   }');
-                    p.stdin.write('   printf "}";');
-                    p.stdin.write("}'\nexit\n");
-                    p.waitExit();
-                }
-
-                var J = JSON.parse(p.stdout.str);
-                if (callback)
-                {
-                    p.args = [];
-                    for (var i = 1; i < arguments.length; ++i) { p.args.push(arguments[i]); }
-
+                    if (out == null || !callback) { return; }
+                    var J = null;
+                    try { J = JSON.parse(out); } catch (e) { console.log('process-manager: ps 输出解析失败（len=' + out.length + '）: ' + e); return; }
                     if (fallback)
                     {
-                        for(pid in J)
+                        for (var fpid in J)
                         {
-                            
                             try
                             {
-                                if (isNaN(parseInt(J[pid].pid))) { delete J[pid]; continue; }
-                                var c = require('fs').readFileSync('/proc/' + pid + '/cmdline');
-                                for(i in c)
+                                if (isNaN(parseInt(J[fpid].pid))) { delete J[fpid]; continue; }
+                                var c = require('fs').readFileSync('/proc/' + fpid + '/cmdline');
+                                for (var ci in c)
                                 {
-                                    if (c[i] == 0) { c[i] = 32; }
+                                    if (c[ci] == 0) { c[ci] = 32; }
                                 }
                                 c = c.toString().trim();
-                                if (c != '' && J[pid].cmd != c) { J[pid].cmd = c; }
+                                if (c != '' && J[fpid].cmd != c) { J[fpid].cmd = c; }
                             }
                             catch(ee)
                             {
                             }
                         }
                     }
-
-                    p.args.unshift(J);
-                    callback.apply(this, p.args);
-                }
+                    passthrough.unshift(J);
+                    callback.apply(this, passthrough);
+                };
+                waitForOutputSentinel(p, 10000, function (out)
+                {
+                    if (p.stderr.str.trim() != '')
+                    {
+                        fallback = true;
+                        var p2 = require('child_process').execFile('/bin/sh', ['sh']);
+                        p2.stdout.str = ''; p2.stdout.on('data', function (c) { this.str += c.toString(); });
+                        p2.stderr.str = ''; p2.stderr.on('data', function (c) { this.str += c.toString(); });
+                        p2.stdin.write("ps | tr '\n' '`' | awk -F'`' '");
+                        p2.stdin.write('{');
+                        p2.stdin.write('   len=split($1,A," "); X=index($1,A[len]);');
+                        p2.stdin.write('   printf "{"; ');
+                        p2.stdin.write('   for(i=2;i<NF;++i)');
+                        p2.stdin.write('   {');
+                        p2.stdin.write('      split($i,TOK," ");');
+                        p2.stdin.write('      cmd=substr($i,X);');
+                        p2.stdin.write('      gsub(/\\\\/,"\\\\\\\\",cmd);');
+                        p2.stdin.write('      gsub(/"/,"\\\\\"",cmd);');
+                        p2.stdin.write('      printf "%s\"%s\":{\"pid\":\"%s\",\"user\":\"%s\",\"cmd\":\"%s\"}",(i==2?"":","),TOK[1],TOK[1],TOK[2],cmd;');
+                        //                                  PID               PID                 USER               command
+                        p2.stdin.write('   }');
+                        p2.stdin.write('   printf "}";');
+                        p2.stdin.write("}'\necho __PS_DONE__\nexit\n");
+                        p2.waitExit();
+                        waitForOutputSentinel(p2, 10000, function (out2) { finishLinux(out2, true); });
+                    }
+                    else
+                    {
+                        finishLinux(out, false);
+                    }
+                });
 
                 break;
             case 'darwin':
@@ -204,14 +234,18 @@ function processManager() {
                 var p = require('child_process').execFile('/bin/sh', ['sh']);
                 p.stdout.str = ''; p.stdout.on('data', function (c) { this.str += c.toString(); });
                 p.stderr.str = ''; p.stderr.on('data', function (c) { this.str += c.toString(); });
-                p.stdin.write('ps -axo pid -o user -o command | tr ' + "'\\n' '\\t' | awk -F" + '"\\t" \'{ printf "{"; for(i=2;i<NF;++i) { gsub(/^[ ]+/,"",$i); split($i,tok," "); pid=tok[1]; user=tok[2]; cmd=substr($i,length(tok[1])+length(tok[2])+2); gsub(/\\\\/,"\\\\\\\\&",cmd); gsub(/"/,"\\\\\\\\&",cmd); gsub(/^[ ]+/,"",cmd); printf "%s\\"%s\\":{\\"pid\\":\\"%s\\",\\"user\\":\\"%s\\",\\"cmd\\":\\"%s\\"}",(i!=2?",":""),pid,pid,user,cmd; } printf "}"; }\'\nexit\n');
+                // [2026-09-20] 管道后追加哨兵行（waitForOutputSentinel 语义，见函数头注释）
+                p.stdin.write('ps -axo pid -o user -o command | tr ' + "'\\n' '\\t' | awk -F" + '"\\t" \'{ printf "{"; for(i=2;i<NF;++i) { gsub(/^[ ]+/,"",$i); split($i,tok," "); pid=tok[1]; user=tok[2]; cmd=substr($i,length(tok[1])+length(tok[2])+2); gsub(/\\\\/,"\\\\\\\\&",cmd); gsub(/"/,"\\\\\\\\&",cmd); gsub(/^[ ]+/,"",cmd); printf "%s\\"%s\\":{\\"pid\\":\\"%s\\",\\"user\\":\\"%s\\",\\"cmd\\":\\"%s\\"}",(i!=2?",":""),pid,pid,user,cmd; } printf "}"; }\'\necho __PS_DONE__\nexit\n');
                 p.waitExit();
-
-                if (callback)
+                // [2026-09-20] 哨兵轮询取代 waitExit 后立即解析（截断竞态修复）；
+                // 透传参数在闭包外捕获（闭包内 arguments 已是哨兵回调自己的）
+                var passthrough = [];
+                for (var ai = 1; ai < arguments.length; ++ai) { passthrough.push(arguments[ai]); }
+                waitForOutputSentinel(p, 10000, function (out)
                 {
-                    var J = JSON.parse(p.stdout.str);
-                    p.args = [];
-                    for (var i = 1; i < arguments.length; ++i) { p.args.push(arguments[i]); }
+                    if (out == null || !callback) { return; }
+                    var J = null;
+                    try { J = JSON.parse(out); } catch (e) { console.log('process-manager: ps 输出解析失败（len=' + out.length + '）: ' + e); return; }
                     if (process.platform == 'freebsd')
                     {
                         for (pid in J)
@@ -219,9 +253,9 @@ function processManager() {
                             try
                             {
                                 var c = require('fs').readFileSync('/proc/' + pid + '/cmdline');
-                                for (i in c)
+                                for (var ci in c)
                                 {
-                                    if (c[i] == 0) { c[i] = 32; }
+                                    if (c[ci] == 0) { c[ci] = 32; }
                                 }
                                 if (c.toString().trim() != '' && J[pid].cmd != c.toString()) { J[pid].cmd = c.toString(); }
                             }
@@ -230,9 +264,9 @@ function processManager() {
                             }
                         }
                     }
-                    p.args.unshift(J);
-                    callback.apply(this, p.args);
-                }
+                    passthrough.unshift(J);
+                    callback.apply(this, passthrough);
+                });
 
                 break;
         }
