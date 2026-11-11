@@ -10,8 +10,12 @@ STRIP=x86_64-w64-mingw32-strip
 
 # ---- 编译标志 ----
 INC="-I. -Iopenssl/include -Imicrostack -Imicroscript -Imeshcore -Imeshconsole -Imeshservice"
-DEFS="-DWIN32 -D_WINSERVICE -D_LINKVM -DMESH_AGENTID=4 -DMICROSTACK_PROXY -DMICROSTACK_NO_STDAFX"
-CFLAGS="-std=gnu99 -g -Wall -fno-strict-aliasing ${INC} ${DEFS} -include mingw-compat.h"
+DEFS="-DWIN32 -D_WINSERVICE -D_LINKVM -DMESH_AGENTID=4 -DMICROSTACK_PROXY -DMICROSTACK_NO_STDAFX -DMICROSTACK_TLS_DETECT"
+# 2026-11-11：GCC 14 起 incompatible-pointer-types/int-conversion 默认按 error——
+# 上游代码在 MSVC 宽松 C 模式下长期依赖这类隐式转换（如线程入口函数指针），
+# 降回警告以完成全量链接（产物为功能验证用；MSVC/CI 才是生产门禁）
+LAX="-Wno-error=incompatible-pointer-types -Wno-error=int-conversion"
+CFLAGS="-std=gnu99 -g -Wall -fno-strict-aliasing ${LAX} ${INC} ${DEFS} -include mingw-compat.h"
 CXXFLAGS="-std=c++11 -g -Wall -fno-strict-aliasing ${INC} ${DEFS}"
 
 OUTDIR="build/win64"

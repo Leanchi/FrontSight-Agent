@@ -274,7 +274,10 @@ wincrypto_object __fastcall wincrypto_open(int newcert, char *rootSubject)
 	ZeroMemory(&certExtension, sizeof(certExtension));
 
 	// Set key usage for root certificate
-	BYTE ByteData = CERT_KEY_CERT_SIGN_KEY_USAGE | CERT_OFFLINE_CRL_SIGN_KEY_USAGE | CERT_CRL_SIGN_KEY_USAGE;
+	/* 2026-11-11：初始化拆为声明+赋值——本函数多个 goto error 跳转跨越此局部，
+	 * MSVC 宽容（跳过初始化），GCC（MinGW）按标准拒绝 jump past initialization；
+	 * 拆开后语义与 MSVC 实际编译行为一致 */
+	BYTE ByteData; ByteData = CERT_KEY_CERT_SIGN_KEY_USAGE | CERT_OFFLINE_CRL_SIGN_KEY_USAGE | CERT_CRL_SIGN_KEY_USAGE;
 	ZeroMemory(&keyusage2, sizeof(keyusage2));
 	keyusage2.cbData = 1;
 	keyusage2.pbData = &ByteData;

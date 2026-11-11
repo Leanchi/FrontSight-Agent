@@ -57,6 +57,10 @@ limitations under the License.
 #include "../microstack/ILibCrypto.h"
 #include "meshinfo.h"
 
+/* 2026-11-11：info_GetLocalInterfaces 双平台定义于本文件(:63/:347)但无头文件声明，
+ * 调用点(:475)此前靠 C89 隐式声明——MSVC 宽容，GCC14（MinGW 交叉编译）按错误处理。
+ * 前置声明与两处定义签名一致，双工具链均安全 */
+int info_GetLocalInterfaces(char* data, int maxdata);
 
 #ifdef WINSOCK2
 // This is the Windows implementation of a method that gets information about local interfaces
