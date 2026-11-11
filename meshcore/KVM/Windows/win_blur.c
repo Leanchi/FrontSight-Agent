@@ -326,6 +326,181 @@ static BOOL CALLBACK win_blur_enum_proc(HWND hwnd, LPARAM lparam)
 }
 
 /* ------------------------------------------------------------------
+ * 从进程关键字回灌（2026-11-11 Windows 真机排查轮修复）
+ *
+ * 根因：Windows KVM 为主从进程架构（agentcore.c kvmPipe）——采集跑在被 spawn 的
+ * 从进程里，而服务端推送的关键字经 JS 层 setKeywords 只写进【主进程】的
+ * g_blur_override；从进程内存全新，override=NULL → 回落编译期默认集，
+ * 推送的关键字对画面永远不生效（实测日志 covered=7 / 0 regions 的成因）。
+ * mac/linux KVM 单进程无此问题。
+ *
+ * 修复：JS 层每次推送本就把关键字持久化到 <agentCwd>/blur-keywords.json
+ * （meshcore.js applyBlurKeywords，与 mac/linux 重启恢复同一份文件）——
+ * 从进程在 get_blurred_regions 每帧 stat 该文件（cwd 与 exe 目录双路探测，
+ * 子进程通常继承主进程 cwd），mtime 变化才重读重解析 → 会话中改关键字
+ * 也能实时跟上（与广播热生效语义对齐）。解析失败/文件缺省回落既有逻辑
+ * （编译期默认集），不中途清空已生效集。
+ * ------------------------------------------------------------------ */
+
+static FILETIME blur_file_last_mtime;	/* 上次加载时的文件 mtime;零值=从未加载过（mtime 相同即跳过） */
+
+/* 在 dir 下探测 blur-keywords.json;命中返回句柄并记录路径与 mtime */
+static HANDLE blur_open_if_changed(char *dir, WIN32_FILE_ATTRIBUTE_DATA *fad)
+{
+	char path[MAX_PATH * 2];
+
+	if (dir == NULL || dir[0] == '\0') return INVALID_HANDLE_VALUE;
+	if (sprintf_s(path, sizeof(path), "%s\\blur-keywords.json", dir) <= 0) return INVALID_HANDLE_VALUE;
+	if (!GetFileAttributesExA(path, GetFileExInfoStandard, fad)) return INVALID_HANDLE_VALUE;
+	if (fad->ftLastWriteTime.dwLowDateTime == blur_file_last_mtime.dwLowDateTime &&
+		fad->ftLastWriteTime.dwHighDateTime == blur_file_last_mtime.dwHighDateTime) {
+		return INVALID_HANDLE_VALUE;	/* mtime 未变：沿用内存现值（零值 FILETIME=从未加载，真实文件不会等于零） */
+	}
+	return CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+		OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+}
+
+/* 极简 JSON 字符串数组解析：从 {"keywords":[...]} 提取字符串数组。
+ * 处理转义 \" \\ \/ \b \f \n \r \t 与 \uXXXX（UTF-8 编码输出）；非 ASCII 原样字节
+ * （Duktape JSON.stringify 不转义 CJK，文件里即原生 UTF-8）。
+ * 返回成功条数；失败返回 -1 且【自行释放已分配项】（调用方无须清理）。 */
+static int blur_parse_keywords_json(char *text, char **out_kw, int max_kw)
+{
+	char *p = strstr(text, "\"keywords\"");
+	int count = 0;
+	int i;
+
+	if (p == NULL) return -1;
+	p = strchr(p + 10, '[');
+	if (p == NULL) return -1;
+	p++;
+
+	while (*p != '\0' && *p != ']') {
+		char buf[300];		/* 单项上限 256B + 转义余量（与 kvm_blur_module 一致） */
+		int n = 0;
+
+
+		while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+		if (*p == ']' || *p == '\0') break;
+		if (*p != '"') goto fail;	/* 只接受字符串数组 */
+		p++;
+		while (*p != '"' && *p != '\0' && n < (int)sizeof(buf) - 8) {
+			if (*p == '\\') {
+				p++;
+				switch (*p) {
+				case '"': buf[n++] = '"'; break;
+				case '\\': buf[n++] = '\\'; break;
+				case '/': buf[n++] = '/'; break;
+				case 'b': buf[n++] = '\b'; break;
+				case 'f': buf[n++] = '\f'; break;
+				case 'n': buf[n++] = '\n'; break;
+				case 'r': buf[n++] = '\r'; break;
+				case 't': buf[n++] = '\t'; break;
+				case 'u': {
+					/* \uXXXX → UTF-8（BMP 内即可：关键字场景足够） */
+					int cp = 0, h;
+					for (h = 0; h < 4 && p[1] != '\0'; h++) {
+						char c = *(++p);
+						cp <<= 4;
+						if (c >= '0' && c <= '9') cp |= c - '0';
+						else if (c >= 'a' && c <= 'f') cp |= c - 'a' + 10;
+						else if (c >= 'A' && c <= 'F') cp |= c - 'A' + 10;
+						else goto fail;
+					}
+					if (h < 4) goto fail;
+					if (cp < 0x80) buf[n++] = (char)cp;
+					else if (cp < 0x800) { buf[n++] = (char)(0xC0 | (cp >> 6)); buf[n++] = (char)(0x80 | (cp & 0x3F)); }
+					else { buf[n++] = (char)(0xE0 | (cp >> 12)); buf[n++] = (char)(0x80 | ((cp >> 6) & 0x3F)); buf[n++] = (char)(0x80 | (cp & 0x3F)); }
+					break;
+				}
+				default: goto fail;
+				}
+				p++;
+			} else {
+				buf[n++] = *(p++);
+			}
+		}
+		if (*p != '"') goto fail;
+		p++;
+		buf[n] = '\0';
+
+		if (count < max_kw) {
+			out_kw[count] = (char *)malloc(n + 1);
+			if (out_kw[count] == NULL) goto fail;
+			memcpy(out_kw[count], buf, n + 1);
+			count++;
+		} else {
+			break;	/* 超出容量截断（服务端 canonicalize 上限 64 与模块上限一致） */
+		}
+	}
+	return count;
+
+fail:
+
+	for (i = 0; i < count; i++) free(out_kw[i]);
+	return -1;
+}
+
+/* 每帧调用：文件变了才重载。cwd → exe 目录双路。失败静默沿用现值。 */
+static void blur_maybe_reload(void)
+{
+	WIN32_FILE_ATTRIBUTE_DATA fad;
+	HANDLE h = INVALID_HANDLE_VALUE;
+	char *dir = NULL;
+	char cwd[MAX_PATH];
+	char exe[MAX_PATH * 2];
+	char *text = NULL;
+	char **kws = NULL;
+	DWORD len, got = 0;
+	int n, i;
+
+	/* 路径一：当前工作目录（子进程通常继承主进程 cwd——服务态即 System32/安装目录） */
+	if (GetCurrentDirectoryA(MAX_PATH, cwd) > 0) {
+		h = blur_open_if_changed(cwd, &fad);
+		if (h != INVALID_HANDLE_VALUE) dir = cwd;
+	}
+	/* 路径二：exe 同目录（cwd 探测失败/文件不在 cwd 时） */
+	if (h == INVALID_HANDLE_VALUE && GetModuleFileNameA(NULL, exe, sizeof(exe)) > 0) {
+		char *slash = strrchr(exe, '\\');
+		if (slash != NULL) {
+			*slash = '\0';
+			h = blur_open_if_changed(exe, &fad);
+			if (h != INVALID_HANDLE_VALUE) dir = exe;
+		}
+	}
+	if (h == INVALID_HANDLE_VALUE) return;	/* 文件不存在或未变化 */
+
+	len = fad.nFileSizeLow;
+	if (len <= 0 || len > 64 * 1024) { CloseHandle(h); return; }	/* 防御:关键字文件上界 64KB */
+	text = (char *)malloc(len + 1);
+	if (text == NULL) { CloseHandle(h); return; }
+	if (!ReadFile(h, text, len, &got, NULL) || got != len) { free(text); CloseHandle(h); return; }
+	CloseHandle(h);
+	text[got] = '\0';
+
+	kws = (char **)malloc(64 * sizeof(char *));
+	if (kws == NULL) { free(text); return; }
+
+	n = blur_parse_keywords_json(text, kws, 64);
+	free(text);
+	if (n < 0) {
+		/* 解析失败：保持现值不动（不中途清空），记录 mtime 防反复读同一坏文件。
+		 * n<0 时解析器保证未向 kws 写入任何项，无需释放 */
+		blur_file_last_mtime = fad.ftLastWriteTime;
+		BLUR_LOG("[BLUR] keyword file parse failed, keeping current set\n");
+		return;
+	}
+
+	/* 应用到共享匹配层（blur_set_keywords 深拷贝接管，此处释放解析临时串） */
+	blur_set_keywords((const char **)kws, n);
+	for (i = 0; i < n; i++) free(kws[i]);
+	free(kws);
+
+	blur_file_last_mtime = fad.ftLastWriteTime;
+	BLUR_LOG("[BLUR] reloaded %d keywords from %s\\blur-keywords.json\n", n, (dir != NULL) ? dir : "?");
+}
+
+/* ------------------------------------------------------------------
  * 对外接口
  * ------------------------------------------------------------------ */
 
@@ -363,6 +538,7 @@ int get_blurred_regions(BlurRect **regions)
 
 	/* Z 序枚举顶层窗口。服务进程无自窗，无需排除自身（design §1）；
 	 * 返回值不判定：失败时已收集的区域仍然有效（保守多遮，安全方向） */
+	blur_maybe_reload();	/* 从进程关键字回灌（文件头注释）——mtime 门控,每帧成本一次 stat */
 	EnumWindows(win_blur_enum_proc, (LPARAM)&ctx);
 
 	BLUR_LOG("[BLUR] Final: %d blur regions (covered=%d)\n", ctx.out_count, ctx.covered_count);
