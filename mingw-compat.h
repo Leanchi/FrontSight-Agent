@@ -11,6 +11,10 @@
 /* 2026-11-11：WIN32_LEAN_AND_MEAN 会从 windows.h 剥掉 wincrypt——ILibCrypto.c 的证书库 API
  * (HCERTSTORE/CertOpenSystemStoreW 等)在 MSVC 侧经传递包含可见，MinGW 需显式引入 */
 #include <wincrypt.h>
+/* 2026-11-11：VARIANT（ILibDuktape_GenericMarshal.c 用）经 ole2/oleauto 链可见——
+ * LEAN_AND_MEAN 同样会剥掉；MSVC 侧经传递包含 */
+#include <ole2.h>
+#include <oleauto.h>
 /* 2026-11-11：struct ip_mreq 原在此自定义（2026-05 初版 MinGW 的 ws2tcpip.h 不带它），
  * 新版 MinGW（14.x）的 ws2tcpip.h 自带定义 → 无条件自定义必撞"redefinition"。
  * 修正：直接引 ws2tcpip.h 取工具链定义，删除自定义（上面已 include，下方结构体已移除）。 */
