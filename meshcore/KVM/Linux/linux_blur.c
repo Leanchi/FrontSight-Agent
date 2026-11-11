@@ -143,9 +143,12 @@ static char *get_window_title(Display *disp, Window win)
 /* 检查窗口标题是否匹配虚化关键字 */
 static int title_matches_blur(const char *title)
 {
+    int kwcount = 0;
+    /* 关键字来源改走运行时访问器（override 未设置时回编译期 BLUR_KEYWORDS），匹配逻辑不变 */
+    const char **kws = blur_get_keywords(&kwcount);
     if (!title) return 0;
-    for (int k = 0; k < BLUR_KEYWORD_COUNT; k++) {
-        if (should_blur_window(title, BLUR_KEYWORDS[k])) {
+    for (int k = 0; k < kwcount; k++) {
+        if (should_blur_window(title, kws[k])) {
             return 1;
         }
     }

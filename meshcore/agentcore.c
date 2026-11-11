@@ -43,6 +43,7 @@ limitations under the License.
 #include "microscript/ILibDuktape_ScriptContainer.h"
 #include "../microstack/ILibIPAddressMonitor.h"
 #include "paintbrush_overlay.h"
+#include "kvm_blur_module.h"
 
 #ifdef _POSIX
 #include <sys/stat.h>
@@ -2102,6 +2103,9 @@ void ILibDuktape_MeshAgent_Init(duk_context* ctx, void *chain, MeshAgentHostCont
 #elif defined(__linux__)
 	ILibDuktape_ModSearch_AddHandler(ctx, "paintbrush-overlay", paintbrush_overlay_PUSH);	/* X11 ARGB 实现 paintbrush_overlay.c */
 #endif
+	/* kvm-blur 遮罩关键字模块：纯字符串表、零图形 API，三平台共用一份实现（kvm_blur_module.c），
+	 * 与 paintbrush-overlay 的按平台分流不同——单条无条件注册，不套平台 #ifdef */
+	ILibDuktape_ModSearch_AddHandler(ctx, "kvm-blur", kvm_blur_PUSH);
 	/* 其余平台（BSD 等）不编译 overlay 实现，也不注册模块 */
 }
 
@@ -5955,6 +5959,9 @@ void MeshAgent_ScriptMode(MeshAgentHostContainer *agentHost, int argc, char **ar
 #elif defined(__linux__)
 		ILibDuktape_ModSearch_AddHandler(agentHost->meshCoreCtx, "paintbrush-overlay", paintbrush_overlay_PUSH);
 #endif
+		/* kvm-blur 同为平台中立模块，无条件注册（与 ILibDuktape_MeshAgent_Init 处一致，
+		 * 保证 script-only 模式下 require('kvm-blur') 也可用） */
+		ILibDuktape_ModSearch_AddHandler(agentHost->meshCoreCtx, "kvm-blur", kvm_blur_PUSH);
 
 		duk_push_global_object(agentHost->meshCoreCtx);									// [g]
 		duk_push_c_function(agentHost->meshCoreCtx, MeshAgent_ScriptMode_StartAgent, 0);// [g][startAgent]

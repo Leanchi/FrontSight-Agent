@@ -153,6 +153,11 @@ int get_blurred_regions(CGRect **regions)
 	}
 	int match_count = 0;
 
+	/* 运行时关键字表（override 未设置时由访问器回编译期 BLUR_KEYWORDS 兜底）：
+	 * 每次枚举取一次指针，两个匹配循环（窗口名/进程所有者名）共用 */
+	int kwcount = 0;
+	const char **blur_kws = blur_get_keywords(&kwcount);
+
 	for (CFIndex i = 0; i < count; i++) {
 		CFDictionaryRef win_info = (CFDictionaryRef)CFArrayGetValueAtIndex(window_list, i);
 		if (!win_info) continue;
@@ -172,8 +177,8 @@ int get_blurred_regions(CGRect **regions)
 		if (win_name && CFStringGetLength(win_name) > 0) {
 			char buf[256];
 			if (CFStringGetCString(win_name, buf, sizeof(buf), kCFStringEncodingUTF8)) {
-				for (int k = 0; k < BLUR_KEYWORD_COUNT; k++) {
-					if (should_blur_window(buf, BLUR_KEYWORDS[k])) {
+				for (int k = 0; k < kwcount; k++) {
+					if (should_blur_window(buf, blur_kws[k])) {
 						should_blur = 1;
 						break;
 					}
@@ -184,8 +189,8 @@ int get_blurred_regions(CGRect **regions)
 		if (!should_blur && owner_name && CFStringGetLength(owner_name) > 0) {
 			char buf[256];
 			if (CFStringGetCString(owner_name, buf, sizeof(buf), kCFStringEncodingUTF8)) {
-				for (int k = 0; k < BLUR_KEYWORD_COUNT; k++) {
-					if (should_blur_window(buf, BLUR_KEYWORDS[k])) {
+				for (int k = 0; k < kwcount; k++) {
+					if (should_blur_window(buf, blur_kws[k])) {
 						should_blur = 1;
 						break;
 					}
