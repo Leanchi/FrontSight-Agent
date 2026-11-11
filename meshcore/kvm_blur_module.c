@@ -33,8 +33,9 @@
 /* ------------------------------------------------------------------
  * BLUR_DEBUG 条件日志（A6）：沿 linux_blur.c 的 /tmp/blur_debug.log 机制。
  * 差异：本文件用追加模式 "a" —— 记录的是低频 set/get 事件，不应像采集
- * 路径那样每次调用截断重建日志；Windows 无 /tmp，文件日志留待 child-1
- * 挂 sln 时按平台补（BLUR_DEBUG 下宏展开为空，不影响编译）。
+ * 路径那样每次调用截断重建日志；Windows 无 /tmp，采集路径的 Windows 日志
+ * 已由 win_blur.c（BLUR_DEBUG 下落 %TEMP%/blur_debug.log）承担，本模块
+ * Windows 侧低频 set/get 事件不落盘（BLUR_DEBUG 下宏展开为空，不影响编译）。
  * ------------------------------------------------------------------ */
 #if defined(KVM_BLUR_WIN32) || !defined(BLUR_DEBUG)
 #define BLURMOD_LOG(fmt, ...)

@@ -10760,7 +10760,10 @@ void inet_pton_setup()
 	if (inet_ntop_ptr == NULL || inet_pton_ptr == NULL) inet_pton_setup_done = 2;
 }
 
-char* ILibInet_ntop(int af, const char *src, char *dst, size_t dstsize)
+/* 2026-11-11：签名对齐 ILibParsers.h（const void 与 void 形参）——原 Windows 分支用 char 形参，
+ * MSVC 的宽松 C 模式容忍 void 与 char 指针混用，GCC（MinGW 交叉编译）按标准报 conflicting types；
+ * 对齐后 MSVC 侧二进制行为不变（指针表示相同），MinGW 全量链接得以通过。 */
+char* ILibInet_ntop(int af, const void *src, char *dst, size_t dstsize)
 {
 	if (inet_pton_setup_done == 0) inet_pton_setup();
 
@@ -10773,12 +10776,12 @@ char* ILibInet_ntop(int af, const char *src, char *dst, size_t dstsize)
 	{
 		// Use the alternate IPv4 only version
 		if (af != AF_INET) return NULL;
-		_snprintf_s(dst, dstsize, dstsize, "%u.%u.%u.%u", (unsigned char)src[0], (unsigned char)src[1], (unsigned char)src[2], (unsigned char)src[3]);
+		_snprintf_s(dst, dstsize, dstsize, "%u.%u.%u.%u", ((const unsigned char*)src)[0], ((const unsigned char*)src)[1], ((const unsigned char*)src)[2], ((const unsigned char*)src)[3]);
 		return dst;
 	}
 }
 
-int ILibInet_pton(int af, const char *src, char *dst)
+int ILibInet_pton(int af, const char *src, void *dst)
 {
 	if (inet_pton_setup_done == 0) inet_pton_setup();
 
