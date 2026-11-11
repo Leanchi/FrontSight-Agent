@@ -7,7 +7,10 @@
 #define _WIN32_WINNT 0x0600
 
 #include <winsock2.h>
-#include <ws2ipdef.h>
+#include <ws2tcpip.h>
+/* 2026-11-11：struct ip_mreq 原在此自定义（2026-05 初版 MinGW 的 ws2tcpip.h 不带它），
+ * 新版 MinGW（14.x）的 ws2tcpip.h 自带定义 → 无条件自定义必撞"redefinition"。
+ * 修正：直接引 ws2tcpip.h 取工具链定义，删除自定义（上面已 include，下方结构体已移除）。 */
 
 /* ---- socklen_t ---- */
 typedef int socklen_t;
@@ -16,11 +19,7 @@ typedef int socklen_t;
 extern const struct in6_addr in6addr_any;
 extern const struct in6_addr in6addr_loopback;
 
-/* ---- struct ip_mreq（在 ws2tcpip.h 中，避免冲突） ---- */
-struct ip_mreq {
-    struct in_addr imr_multiaddr;
-    struct in_addr imr_interface;
-};
+/* ---- struct ip_mreq：已改由 <ws2tcpip.h> 提供（见文件头注释，2026-11-11） ---- */
 
 /* ---- 常量 ---- */
 #ifndef IPPROTO_IPV6

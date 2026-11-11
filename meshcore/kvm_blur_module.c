@@ -23,7 +23,9 @@
 #include <pthread.h>
 #endif
 
-#include "duktape.h"
+/* duktape 头用根目录相对路径：makefile（-I.）与 MSVC（vcxproj 根 include 路径）均可解析；
+ * 裸 "duktape.h" 仅 POSIX -Imicroscript 可解析，Windows 工程编译会找不到文件 */
+#include "microscript/duktape.h"
 #include "microscript/ILibDuktape_Helpers.h"
 #include "KVM/blur_config.h"
 #include "kvm_blur_module.h"

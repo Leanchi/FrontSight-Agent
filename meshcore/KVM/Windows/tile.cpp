@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <stdio.h>
 #include "tile.h"
+#include "win_blur.h"
 #include <gdiplus.h>
 #include "meshcore/meshdefines.h"
 using namespace Gdiplus;
@@ -599,6 +600,25 @@ int get_desktop_buffer(void **buffer, long long *bufferSize, long* mouseMove)
 	
 	bmpInfo.bmiHeader.biCompression = BI_RGB;
 	if (GetDIBits(hDesktopDC, hCapturedBitmap, 0, bmpInfo.bmiHeader.biHeight, *buffer, &bmpInfo, DIB_RGB_COLORS) == 0) { KVMDEBUG("GetDIBits() failed", 0); free(*buffer); return(1); }
+
+	// [窗口虚化] 采集完成之后、tile 编码之前：标题命中关键字的窗口区域填灰
+	// （语义位对齐 linux_kvm.c —— getScreenBuffer 后即 apply，再进 tile 循环）。
+	// 缓冲区行序按 bmpInfo.bmiHeader.biHeight 实际符号判定（正 = bottom-up，
+	// 缓冲第 0 行是屏幕底行）；SCALING_FACTOR != 1024 的缩放采集由 apply 内部做坐标缩放。
+	// 失败安全：get_blurred_regions 任何失败返回 0 区域，画面原样，不影响采集线程。
+	{
+		BlurRect *blur_regions = NULL;
+		int blur_count = get_blurred_regions(&blur_regions);
+		if (blur_count > 0 && blur_regions != NULL)
+		{
+			int bufh = bmpInfo.bmiHeader.biHeight < 0 ? -bmpInfo.bmiHeader.biHeight : bmpInfo.bmiHeader.biHeight;
+			apply_blur_to_regions_win((unsigned char *)*buffer, *bufferSize,
+				bmpInfo.bmiHeader.biWidth, bufh,
+				(bmpInfo.bmiHeader.biHeight < 0) ? 1 : 0,
+				blur_regions, blur_count);
+			free_blurred_regions(blur_regions);
+		}
+	}
 
 	return 0;
 }

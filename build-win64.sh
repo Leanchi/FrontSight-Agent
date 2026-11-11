@@ -49,7 +49,8 @@ echo "[3/6] meshcore + paintbrush_overlay_win..."
 for f in \
     meshcore/zlib/adler32 meshcore/zlib/deflate meshcore/zlib/inffast \
     meshcore/zlib/inflate meshcore/zlib/inftrees meshcore/zlib/trees \
-    meshcore/zlib/zutil meshcore/agentcore meshcore/meshinfo; do
+    meshcore/zlib/zutil meshcore/agentcore meshcore/meshinfo \
+    meshcore/kvm_blur_module; do
     $CC $CFLAGS -c ${f}.c -o $OUTDIR/$(basename ${f}).o
 done
 # paintbrush_overlay_win.cpp (C++ 文件)
@@ -60,6 +61,7 @@ echo "  OK"
 echo "[4/6] Windows KVM..."
 $CC $CFLAGS -c meshcore/KVM/Windows/kvm.c -o $OUTDIR/kvm.o
 $CC $CFLAGS -c meshcore/KVM/Windows/input.c -o $OUTDIR/input.o
+$CC $CFLAGS -c meshcore/KVM/Windows/win_blur.c -o $OUTDIR/win_blur.o
 $CC $CFLAGS -c meshcore/wincrypto.cpp -o $OUTDIR/wincrypto.o
 $CXX $CXXFLAGS -c meshcore/KVM/Windows/tile.cpp -o $OUTDIR/tile.o
 echo "  OK"
@@ -74,10 +76,10 @@ echo "  OK"
 echo "[6/6] Linking MeshService64.exe..."
 WINLIBS="-lws2_32 -lshlwapi -lcrypt32 -ladvapi32 -luser32 -lgdi32 -lgdiplus \
     -lcomctl32 -lole32 -lshell32 -lsetupapi -lpsapi -ldbghelp -lwtsapi32 \
-    -lwinhttp -loleaut32 -lssp -liphlpapi"
+    -lwinhttp -loleaut32 -lssp -liphlpapi -ldwmapi"
 
 $CXX -o $OUTDIR/MeshService64.exe $OUTDIR/*.o \
-    openssl/libstatic/bsd/libcrypto64MT.lib openssl/libstatic/bsd/libssl64MT.lib \
+    openssl/libstatic/libcrypto64MT.lib openssl/libstatic/libssl64MT.lib \
     $WINLIBS -static-libgcc -static-libstdc++ 2>&1 && \
     $STRIP $OUTDIR/MeshService64.exe && \
     echo "  DONE" && ls -lh $OUTDIR/MeshService64.exe && \

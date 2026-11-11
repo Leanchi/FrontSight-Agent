@@ -719,6 +719,13 @@ int kvm_server_inputdata(char* block, int blocklen)
 	size = ntohs(((unsigned short*)(block))[1]);
 	if (size > blocklen) return 0;
 
+	// ===== XZDIAG 2026-07-31: 键鼠消息是否到达 slave =====
+	if (logFile && (type == 1 || type == 2 || type == 85)) {
+		fprintf(logFile, "XZDIAG inputdata: type=%d (1=Key,2=Mouse,85=KeyUnicode) size=%d blocklen=%d\n", type, size, blocklen);
+		fflush(logFile);
+	}
+	// ===== XZDIAG END =====
+
 	switch (type)
 	{
 	case MNG_KVM_KEY_UNICODE: // Unicode Key
